@@ -30,7 +30,7 @@ use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::
 use nativelink_proto::com::github::trace_machina::nativelink::remote_execution::{
     execute_declined, execute_result, ExecuteAccepted, ExecuteComplete, ExecuteDeclined, ExecuteResult, GoingAwayRequest, KeepAliveRequest, UpdateForScheduler, UpdateForWorker
 };
-use nativelink_scheduler::worker::Worker;
+use nativelink_scheduler::worker::{MemoryCharge, Worker};
 use nativelink_scheduler::worker_scheduler::WorkerScheduler;
 use nativelink_util::background_spawn;
 use nativelink_util::action_messages::{OperationId, WorkerId};
@@ -220,6 +220,11 @@ impl WorkerApiServer {
                 connect_worker_request.max_inflight_tasks,
             );
             worker.admits_when_idle = connect_worker_request.admits_when_idle;
+            worker.memory_charge = if connect_worker_request.memory_guarded {
+                MemoryCharge::Request
+            } else {
+                MemoryCharge::Limit
+            };
             self.scheduler
                 .add_worker(worker)
                 .await

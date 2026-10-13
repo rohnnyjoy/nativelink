@@ -4044,6 +4044,7 @@ async fn a_higher_memory_report_mid_pass_goes_to_the_oldest_waiting_action() -> 
             NOW_TIME + 1,
             Some(WorkerLoad {
                 free_memory_kb: 1_000,
+                owed_kb: 0,
             }),
         )
         .await?;
@@ -4073,6 +4074,7 @@ async fn a_higher_memory_report_mid_pass_goes_to_the_oldest_waiting_action() -> 
             NOW_TIME + 2,
             Some(WorkerLoad {
                 free_memory_kb: 50_000,
+                owed_kb: 0,
             }),
         )
         .await?;

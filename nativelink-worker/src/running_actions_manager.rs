@@ -16,7 +16,7 @@ use core::cmp::min;
 use core::convert::Into;
 use core::fmt::Debug;
 use core::pin::Pin;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use core::time::Duration;
 use std::borrow::Cow;
 use std::collections::vec_deque::VecDeque;
@@ -43,7 +43,8 @@ use futures::future::{
 use futures::stream::{FuturesUnordered, StreamExt, TryStreamExt};
 use nativelink_config::cas_server::{
     Buck2FileCaptureConfig, DiskEnforcement, EnvironmentSource, MemoryEnforcement,
-    ResourceEnforcementConfig, UploadActionResultConfig, UploadCacheResultsStrategy,
+    MemoryPressureConfig, ResourceEnforcementConfig, UploadActionResultConfig,
+    UploadCacheResultsStrategy,
 };
 use nativelink_error::{Code, Error, ResultExt, make_err, make_input_err};
 use nativelink_metric::MetricsComponent;
@@ -128,6 +129,35 @@ struct SampledResourceUsage {
     peak_disk_kb: u64,
 }
 
+/// What the pressure guard and the keepalive read of one running action's
+/// memory: the request and limit from its platform properties, the
+/// sampler's last reading, and when its command started.
+#[derive(Debug, Default)]
+pub struct ActionMemory {
+    /// KiB the scheduler placed the action by; 0 when it carries none.
+    request_kb: u64,
+    /// KiB its kill line is computed from; 0 when it carries none.
+    limit_kb: u64,
+    /// The sampler's last reading of the action's process tree, in KiB.
+    last_kb: AtomicU64,
+    /// When the action's own command started, while it runs. A pooled
+    /// action never sets it: its process is shared, and killing it would
+    /// free nothing the guard can count on.
+    started: Mutex<Option<std::time::Instant>>,
+    /// Woken by the pressure guard to kill the command.
+    pressure_kill: Notify,
+}
+
+impl ActionMemory {
+    fn new(request_kb: u64, limit_kb: u64) -> Self {
+        Self {
+            request_kb,
+            limit_kb,
+            ..Self::default()
+        }
+    }
+}
+
 /// Why the worker ended an action before the action ended itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KillReason {
@@ -135,6 +165,9 @@ pub enum KillReason {
     Memory,
     Disk,
     External,
+    /// The pressure guard (`crate::pressure`) took it to relieve the
+    /// worker as a whole.
+    Pressure,
 }
 
 const SIGKILL_NUMBER: i32 = 9;
@@ -161,19 +194,74 @@ fn tag_missing_input(err: Error) -> Error {
 /// left behind is read to the end.
 const OUTPUT_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Classifies how an action ended. A kill the worker sent names itself; a
-/// SIGKILL nobody here sent, with the last memory sample within 10% of the
-/// limit, is the kernel's OOM killer; any other signal is external.
+/// How an action's process tree ended, as `classify_outcome` reads it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TreeEnding {
+    /// The signal that ended the action's own process, where the platform
+    /// reports one.
+    pub signal: Option<i32>,
+    /// Its exit code, where it exited rather than being signalled.
+    pub exit_code: Option<i32>,
+    /// Whether a process under it died by SIGKILL while it ran (the stub's
+    /// report).
+    pub sigkilled: bool,
+}
+
+/// Classifies how an action ended. A kill the worker sent names itself. A
+/// SIGKILL nobody here sent while the cgroup's `memory.events` `oom_kill`
+/// count rose (`oom_kills_before` read before the action started,
+/// `oom_kills_after` once it ended) is the kernel relieving the worker as a
+/// whole, which the action's `oom_score_adj` points at an action, so it is
+/// pressure and not the action's own fault, whether the kernel took the
+/// root process (SIGKILL) or one under it: the stub's count of descendants
+/// that died by SIGKILL, which covers what the stub reaps (its child and
+/// orphans), or the root exiting 137, 128 plus SIGKILL, which is how a
+/// wrapper reports the process it waited on being killed and the only way
+/// a kill inside bwrap's PID namespace reaches the stub. The count is the
+/// whole worker's, so without one of those in this action's own tree a
+/// rise is another action's. Without that rise, a SIGKILL
+/// with the last memory sample within 10% of the limit is still taken for
+/// the kernel's OOM killer acting on the action; any other signal is
+/// external.
 pub fn classify_outcome(
     kill_reason: Option<KillReason>,
-    signal: Option<i32>,
+    ending: TreeEnding,
     last_memory_kb: u64,
     memory_limit_kb: Option<u64>,
+    oom_kills_before: Option<u64>,
+    oom_kills_after: Option<u64>,
 ) -> (ResourceOutcome, bool) {
+    let TreeEnding {
+        signal,
+        exit_code,
+        sigkilled: tree_sigkilled,
+    } = ending;
+    let exited_clean = exit_code == Some(0);
+    // 128 + SIGKILL: what a shell or a test wrapper exits with when the
+    // process it waited on was killed, which is how a kill inside a PID
+    // namespace (bwrap's, where the stub reaps nothing) reaches the root.
+    let child_sigkilled = tree_sigkilled || exit_code == Some(128 + SIGKILL_NUMBER);
+    let oom_killed = matches!(
+        (oom_kills_before, oom_kills_after),
+        (Some(before), Some(after)) if after > before
+    );
     match (kill_reason, signal) {
         (Some(KillReason::Memory), _) => (ResourceOutcome::KilledMemory, true),
         (Some(KillReason::Disk), _) => (ResourceOutcome::KilledDisk, true),
+        (Some(KillReason::Pressure), _) => (ResourceOutcome::KilledPressure, true),
         (Some(KillReason::Timeout), _) => (ResourceOutcome::KilledTimeout, false),
+        // The kernel took a process of this action's tree while it ran: its
+        // own (a SIGKILL nobody here sent) or one under it (the stub saw a
+        // descendant die by SIGKILL, and the root then ended on its own, not
+        // clean: a test's JVM under its wrapper exits 137). The count alone
+        // is the worker's, so another action's OOM kill beside an exit 1 of
+        // this one's own stays this one's failure.
+        (None, _)
+            if oom_killed
+                && (signal == Some(SIGKILL_NUMBER) || (child_sigkilled && !exited_clean)) =>
+        {
+            (ResourceOutcome::KilledPressure, false)
+        }
         (None, None) => (ResourceOutcome::Completed, false),
         (None, Some(SIGKILL_NUMBER)) => {
             let near_limit = memory_limit_kb.is_some_and(|limit_kb| {
@@ -304,11 +392,12 @@ fn start_action_resource_usage_sampler(
     tree: SampledTree,
     ceilings: Ceilings,
     disk_directory: Option<(PathBuf, SystemTime)>,
+    memory: Arc<ActionMemory>,
 ) -> ActionResourceUsageSampler {
     let (stop_tx, stop_rx) = watch::channel(false);
     let handle = background_spawn!(
         "action_resource_usage_sampler",
-        sample_action_resource_usage(tree, stop_rx, ceilings, disk_directory)
+        sample_action_resource_usage(tree, stop_rx, ceilings, disk_directory, memory)
     );
     ActionResourceUsageSampler { stop_tx, handle }
 }
@@ -411,6 +500,7 @@ async fn sample_action_resource_usage(
     mut stop_rx: watch::Receiver<bool>,
     mut ceilings: Ceilings,
     disk_directory: Option<(PathBuf, SystemTime)>,
+    memory: Arc<ActionMemory>,
 ) -> SampledResourceUsage {
     let mut peak_memory_kb = 0;
     let mut last_memory_kb = 0;
@@ -445,6 +535,7 @@ async fn sample_action_resource_usage(
         }
         if let Some(memory_kb) = observed {
             last_memory_kb = memory_kb;
+            memory.last_kb.store(memory_kb, Ordering::Relaxed);
         }
         if observed.is_none() && !Path::new(&format!("/proc/{}", tree.root)).exists() {
             // The root has been reaped and nothing under it remains, so the
@@ -2062,6 +2153,8 @@ pub struct RunningActionImpl {
     /// Set on a kill; every phase that can wait watches it, so a kill ends
     /// a fetch or an upload as surely as it ends the command.
     kill_token: watch::Sender<bool>,
+    /// What the pressure guard and the keepalive read of its memory.
+    memory: Arc<ActionMemory>,
     state: Mutex<RunningActionImplState>,
     has_manager_entry: AtomicBool,
     did_cleanup: AtomicBool,
@@ -2086,8 +2179,27 @@ impl RunningActionImpl {
         });
         let (kill_channel_tx, kill_channel_rx) = oneshot::channel();
         let (kill_token, _) = watch::channel(false);
+        let memory = running_actions_manager
+            .execution_configuration
+            .resource_enforcement
+            .as_ref()
+            .and_then(|enforcement| enforcement.memory.as_ref())
+            .map_or_else(ActionMemory::default, |memory| {
+                let read = |name: &str| {
+                    action_info
+                        .platform_properties
+                        .get(name)
+                        .and_then(|value| value.trim().parse::<u64>().ok())
+                        .unwrap_or(0)
+                };
+                ActionMemory::new(
+                    read(&memory.request_property_name),
+                    read(&memory.property_name),
+                )
+            });
         Self {
             kill_token,
+            memory: Arc::new(memory),
             operation_id,
             action_directory,
             work_directory,
@@ -2515,6 +2627,7 @@ impl RunningActionImpl {
                                         over_limit_tx: None,
                                     },
                                     None,
+                                    self.memory.clone(),
                                 )
                             });
                             let dispatch_result = {
@@ -2576,8 +2689,18 @@ impl RunningActionImpl {
                                         e.disk_property_name.as_deref(),
                                     )
                                 });
-                            let (outcome, enforced) =
-                                classify_outcome(None, None, sampled_usage.last_memory_kb, None);
+                            let (outcome, enforced) = classify_outcome(
+                                None,
+                                TreeEnding {
+                                    signal: None,
+                                    exit_code: Some(0),
+                                    sigkilled: false,
+                                },
+                                sampled_usage.last_memory_kb,
+                                None,
+                                None,
+                                None,
+                            );
                             let resource_usage = Some(ActionResourceUsage {
                                 peak_memory_kb: sampled_usage.peak_memory_kb,
                                 cpu_time_ms: sampled_usage.cpu_time_ms,
@@ -2780,7 +2903,13 @@ impl RunningActionImpl {
                     .parse::<u64>()
                     .ok()?;
                 (reserved_kb > 0).then(|| {
-                    let limit_kb = reserved_kb.saturating_mul(100 + memory.headroom_percent) / 100;
+                    let limit_kb = crate::capacity::memory_kill_line_kb(
+                        reserved_kb,
+                        memory.headroom_percent,
+                        self.running_actions_manager
+                            .execution_configuration
+                            .memory_room_kb,
+                    );
                     (reserved_kb, limit_kb)
                 })
             });
@@ -2834,11 +2963,22 @@ impl RunningActionImpl {
                     over_limit_tx,
                 },
                 disk_directory,
+                self.memory.clone(),
             )
         });
         #[cfg(not(target_os = "linux"))]
         let _ = &disk_enforcement;
         let mut over_limit_fut = over_limit_rx.fuse();
+        // The cgroup's OOM kills before the action, so a rise by its end
+        // tells a kernel kill under pressure from one the action earned.
+        let oom_kills_before = self.running_actions_manager.oom_kills();
+        // The command is running: from here the pressure guard may choose
+        // it, until the guard below clears the mark however this returns.
+        *self.memory.started.lock() = Some(std::time::Instant::now());
+        let _started_mark = guard(self.memory.clone(), |memory| {
+            *memory.started.lock() = None;
+        });
+        let memory = self.memory.clone();
 
         // The session the spawned child leads, to end when the action's own
         // process has exited; taken before the guard owns the child.
@@ -3005,6 +3145,31 @@ impl RunningActionImpl {
 
                     }
                 },
+                () = memory.pressure_kill.notified() => {
+                    if kill_reason.is_none() {
+                        self.running_actions_manager.metrics.memory_pressure_kills.inc();
+                        kill_reason = Some(KillReason::Pressure);
+                        // The worker is near its limit; no grace here.
+                        hard_kill(&mut child_process_guard, "memory pressure").await;
+                        let observed_kb = memory.last_kb.load(Ordering::Relaxed);
+                        let request_kb = memory.request_kb;
+                        warn!(
+                            operation_id = ?self.operation_id,
+                            request_kb,
+                            limit_kb = memory.limit_kb,
+                            observed_kb,
+                            "Action killed to relieve the worker's memory pressure"
+                        );
+                        let mut state = self.state.lock();
+                        state.error = Error::merge_option(state.error.take(), Some(Error::new(
+                            Code::Unavailable,
+                            format!(
+                                "Action was killed to relieve the worker's memory pressure: requested {request_kb} KiB, \
+                                 observed {observed_kb} KiB. Not the action's fault; it can run again elsewhere."
+                            ),
+                        )));
+                    }
+                },
                 maybe_exit_status = child_process_guard.wait() => {
                     // Defuse our guard so it does not try to cleanup and make senseless logs.
                     drop(ScopeGuard::<_, _>::into_inner(child_process_guard));
@@ -3039,6 +3204,10 @@ impl RunningActionImpl {
                         .is_some_and(|sid| crate::process_tree::signal_session(sid, libc::SIGKILL));
                     #[cfg(not(target_family = "unix"))]
                     let had_stragglers = false;
+                    #[cfg(target_os = "linux")]
+                    let tree_sigkilled = stub_report.is_some_and(|report| report.sigkilled > 0);
+                    #[cfg(not(target_os = "linux"))]
+                    let tree_sigkilled = false;
                     // An action that exited on its own with nothing left in
                     // its session closes its pipes itself, and its output is
                     // the result, so that read runs to the end: a reader
@@ -3098,18 +3267,26 @@ impl RunningActionImpl {
                     let signal = exit_status.signal();
                     #[cfg(not(target_family = "unix"))]
                     let signal = None;
+                    let oom_kills_after = self.running_actions_manager.oom_kills();
                     let (outcome, enforced) = classify_outcome(
                         kill_reason,
-                        signal,
+                        TreeEnding {
+                            signal,
+                            exit_code: exit_status.code(),
+                            sigkilled: tree_sigkilled,
+                        },
                         sampled_usage.last_memory_kb,
                         memory_limit_kb,
+                        oom_kills_before,
+                        oom_kills_after,
                     );
 
                     let exit_code = exit_status.code().map_or_else(|| {
                         self.metrics().child_process_failure_error_code.inc();
                         if kill_reason.is_none() {
                             // No exit code and no kill of ours: a signal from
-                            // outside. SIGKILL near the memory limit is the
+                            // outside. SIGKILL with the cgroup's OOM count
+                            // risen, or near the memory limit, is the
                             // kernel's OOM killer.
                             warn!(
                                 ?args,
@@ -3128,6 +3305,17 @@ impl RunningActionImpl {
                         }
                         exit_code
                     });
+                    if kill_reason.is_none() && outcome == ResourceOutcome::KilledPressure {
+                        let mut state = self.state.lock();
+                        state.error = Error::merge_option(state.error.take(), Some(Error::new(
+                            Code::Unavailable,
+                            format!(
+                                "Action was killed by the kernel's OOM killer at {} KiB while the worker as a whole \
+                                 was out of memory. Not the action's fault; it can run again elsewhere.",
+                                sampled_usage.last_memory_kb,
+                            ),
+                        )));
+                    }
                     if kill_reason.is_none() && outcome == ResourceOutcome::KilledMemory {
                         let mut state = self.state.lock();
                         state.error = Error::merge_option(state.error.take(), Some(Error::new(
@@ -3874,6 +4062,13 @@ pub trait RunningActionsManager: Sync + Send + Sized + Unpin + 'static {
     ) -> impl Future<Output = Result<(), Error>> + Send;
 
     fn metrics(&self) -> &Arc<Metrics>;
+
+    /// Memory the running actions are still expected to take, in KiB: the
+    /// sum over them of their request less their last sample, where the
+    /// request is the larger. Zero where nothing samples.
+    fn owed_memory_kb(&self) -> u64 {
+        0
+    }
 }
 
 /// A function to get the current system time, used to allow mocking for tests
@@ -3927,10 +4122,16 @@ pub struct ResourceEnforcement {
 /// The reservation a memory ceiling is built from.
 #[derive(Debug, Clone)]
 pub struct MemoryLimit {
-    /// Platform property carrying the reservation in KiB.
+    /// Platform property carrying the limit in KiB, the kill line's base.
     pub property_name: String,
-    /// Percent above the reservation the action may reach.
+    /// Platform property carrying the request in KiB, what the scheduler
+    /// placed the action by. The same property as `property_name` where a
+    /// deployment sends one number.
+    pub request_property_name: String,
+    /// Percent above the limit the action may reach.
     pub headroom_percent: u64,
+    /// The worker's pressure guard, when configured (`crate::pressure`).
+    pub pressure: Option<MemoryPressureConfig>,
 }
 
 impl ResourceEnforcement {
@@ -3941,7 +4142,9 @@ impl ResourceEnforcement {
             MemoryEnforcement::None => None,
             MemoryEnforcement::Soft => Some(MemoryLimit {
                 property_name: config.memory_property_name.clone(),
+                request_property_name: config.memory_request_property_name.clone(),
                 headroom_percent: config.memory_headroom_percent,
+                pressure: config.memory_pressure,
             }),
         };
         let disk_property_name =
@@ -3989,6 +4192,11 @@ pub struct ExecutionConfiguration {
     /// Kill an action that exceeds its memory reservation, before the
     /// pod's cgroup limit takes the whole worker with it.
     pub resource_enforcement: Option<ResourceEnforcement>,
+    /// The worker's room for actions in KiB, its cgroup's memory limit
+    /// less `capacity.overhead_memory_kb`, when `capacity` observed a
+    /// cgroup: no action's memory kill line is set past it. `None` leaves
+    /// the line uncapped.
+    pub memory_room_kb: Option<u64>,
     /// Time a timed-out or cancelled action gets between SIGTERM and
     /// SIGKILL to write its own cleanup; zero sends SIGKILL at once.
     pub kill_grace: Duration,
@@ -4340,6 +4548,9 @@ pub struct RunningActionsManagerImpl {
     /// The container's memory limit, the yardstick for calling a SIGKILL
     /// nobody here sent an OOM kill.
     pod_memory_limit_kb: Option<u64>,
+    /// The nearest cgroup with a memory limit, whose `memory.events` says
+    /// whether the kernel's OOM killer acted during an action.
+    memory_cgroup: Option<crate::capacity::LimitedCgroup>,
     #[cfg(target_os = "linux")]
     use_namespaces: UseNamespaces,
     running_actions: Mutex<HashMap<OperationId, Weak<RunningActionImpl>>>,
@@ -4392,6 +4603,15 @@ impl RunningActionsManagerImpl {
         let (action_done_tx, _) = watch::channel(());
         let persistent_worker_pool =
             PersistentWorkerPool::new(args.execution_configuration.persistent_workers.pool);
+        // The cgroup the guard and the OOM count read: the limited one, or
+        // the worker's own against the guard's stated limit (capacity.rs).
+        let pressure_limit_kb = args
+            .execution_configuration
+            .resource_enforcement
+            .as_ref()
+            .and_then(|enforcement| enforcement.memory.as_ref())
+            .and_then(|memory| memory.pressure)
+            .map_or(0, |pressure| pressure.limit_kb);
         let persistent_worker_sweeper = persistent_worker_pool.spawn_sweeper();
         Ok(Self {
             root_action_directory: args.root_action_directory,
@@ -4406,6 +4626,7 @@ impl RunningActionsManagerImpl {
             .err_tip(|| "During RunningActionsManagerImpl construction")?,
             max_action_timeout: args.max_action_timeout,
             pod_memory_limit_kb: pod_memory_limit_kb(),
+            memory_cgroup: crate::capacity::guarded_cgroup(pressure_limit_kb),
             max_upload_timeout: args.max_upload_timeout,
             max_download_timeout: args.max_download_timeout,
             timeout_handled_externally: args.timeout_handled_externally,
@@ -4781,6 +5002,73 @@ impl RunningActionsManagerImpl {
             notified.await;
         }
     }
+
+    /// The worker cgroup's OOM kills so far; `None` where it has no
+    /// memory limit or the file cannot be read.
+    fn oom_kills(&self) -> Option<u64> {
+        self.memory_cgroup
+            .as_ref()?
+            .oom_kills(crate::capacity::read_cgroup_file)
+    }
+
+    fn live_actions(&self) -> Vec<Arc<RunningActionImpl>> {
+        self.running_actions
+            .lock()
+            .values()
+            .filter_map(Weak::upgrade)
+            .collect()
+    }
+
+    /// The actions whose own command is running, as the pressure guard
+    /// weighs them.
+    pub fn pressure_candidates(&self) -> Vec<crate::pressure::PressureCandidate> {
+        self.live_actions()
+            .iter()
+            .filter_map(|action| {
+                let started = (*action.memory.started.lock())?;
+                Some(crate::pressure::PressureCandidate {
+                    operation_id: action.operation_id.clone(),
+                    started,
+                    request_kb: action.memory.request_kb,
+                    limit_kb: action.memory.limit_kb,
+                    last_memory_kb: action.memory.last_kb.load(Ordering::Relaxed),
+                })
+            })
+            .collect()
+    }
+
+    /// Whether the action of `operation_id` is still running: still held by
+    /// this manager, which it is until its command has been reaped and its
+    /// result handled. A killed action stays running until then, which is
+    /// what the pressure guard waits on before it judges again.
+    pub fn is_running(&self, operation_id: &OperationId) -> bool {
+        self.running_actions
+            .lock()
+            .get(operation_id)
+            .and_then(Weak::upgrade)
+            .is_some()
+    }
+
+    /// Kills the command of `operation_id` for memory pressure: SIGKILL, no
+    /// grace, reported as `KILLED_PRESSURE`. The action stops being a
+    /// candidate at once, so the guard cannot choose it twice, and stays
+    /// running (`is_running`) until its tree is reaped. `false` when its
+    /// command is no longer running.
+    pub fn kill_for_pressure(&self, operation_id: &OperationId) -> bool {
+        let Some(action) = self
+            .running_actions
+            .lock()
+            .get(operation_id)
+            .and_then(Weak::upgrade)
+        else {
+            return false;
+        };
+        if action.memory.started.lock().take().is_none() {
+            return false;
+        }
+        action.memory.pressure_kill.notify_one();
+        true
+    }
 }
 
 impl RunningActionsManager for RunningActionsManagerImpl {
@@ -4961,6 +5249,15 @@ impl RunningActionsManager for RunningActionsManagerImpl {
     fn metrics(&self) -> &Arc<Metrics> {
         &self.metrics
     }
+
+    fn owed_memory_kb(&self) -> u64 {
+        crate::pressure::owed_kb(self.live_actions().iter().map(|action| {
+            (
+                action.memory.request_kb,
+                action.memory.last_kb.load(Ordering::Relaxed),
+            )
+        }))
+    }
 }
 
 #[derive(Debug, Default, MetricsComponent)]
@@ -5017,6 +5314,8 @@ pub struct Metrics {
     task_timeouts: CounterWithTime,
     #[metric(help = "Actions killed for exceeding their memory reservation.")]
     memory_reservation_kills: CounterWithTime,
+    #[metric(help = "Actions killed by the pressure guard to relieve the worker's memory.")]
+    memory_pressure_kills: CounterWithTime,
     #[metric(help = "Actions refused because their disk reservation exceeded the free space.")]
     disk_guard_refusals: CounterWithTime,
     #[metric(help = "Actions killed for writing past their disk reservation.")]

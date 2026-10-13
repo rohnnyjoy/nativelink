@@ -42,6 +42,7 @@ async fn make_connect_worker_request_with_extra_envs() -> Result<(), Error> {
         &extra_envs,
         1,
         false,
+        /* memory_guarded */ false,
     )
     .await?;
     assert_eq!(
@@ -65,6 +66,7 @@ async fn make_connect_worker_request_with_values() -> Result<(), Error> {
         &HashMap::new(),
         1,
         false,
+        /* memory_guarded */ false,
     )
     .await?;
     assert_eq!(
@@ -87,6 +89,7 @@ async fn make_connect_worker_request_with_bad_cmd() -> Result<(), Error> {
         &HashMap::new(),
         1,
         false,
+        /* memory_guarded */ false,
     )
     .await
     .unwrap_err();
@@ -118,6 +121,7 @@ async fn make_connect_worker_request_with_bad_exit_code() -> Result<(), Error> {
         &extra_envs,
         1,
         false,
+        /* memory_guarded */ false,
     )
     .await
     .unwrap_err();
@@ -148,6 +152,7 @@ async fn make_connect_worker_request_with_signal() -> Result<(), Error> {
         &extra_envs,
         1,
         false,
+        /* memory_guarded */ false,
     )
     .await
     .unwrap_err();
@@ -174,6 +179,7 @@ async fn make_connect_worker_request_with_stderr() -> Result<(), Error> {
         &extra_envs,
         1,
         false,
+        /* memory_guarded */ false,
     )
     .await?;
     assert_eq!(res.properties.first(), None);
@@ -201,6 +207,7 @@ async fn make_connect_worker_request_with_non_utf8_stderr() -> Result<(), Error>
         &extra_envs,
         1,
         false,
+        /* memory_guarded */ false,
     )
     .await?;
     assert_eq!(res.properties.first(), None);
@@ -228,6 +235,7 @@ async fn make_connect_worker_request_with_multiline() -> Result<(), Error> {
         &extra_envs,
         1,
         false,
+        /* memory_guarded */ false,
     )
     .await?;
     assert_eq!(

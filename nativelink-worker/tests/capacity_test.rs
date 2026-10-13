@@ -23,10 +23,11 @@ use nativelink_error::Code;
 #[cfg(target_family = "unix")]
 use nativelink_worker::capacity::find_limit;
 use nativelink_worker::capacity::{
-    ObservedCapacity, advertised, free_memory_kb_from, free_memory_kb_with,
-    memory_headroom_percent, own_memory_limit_in, parse_cpu_max, parse_meminfo_available_kb,
-    parse_meminfo_total_kb, parse_memory_current_kb, parse_memory_max,
-    parse_memory_stat_reclaimable_kb, parse_self_cgroup, resolve_cgroup_dir, without_cgroup,
+    LimitedCgroup, ObservedCapacity, advertised, free_memory_kb_from, free_memory_kb_with,
+    memory_headroom_percent, memory_kill_line_kb, memory_room_kb, own_memory_limit_in,
+    parse_cpu_max, parse_meminfo_available_kb, parse_meminfo_total_kb, parse_memory_current_kb,
+    parse_memory_events_oom_kill, parse_memory_max, parse_memory_stat_reclaimable_kb,
+    parse_memory_stat_unreclaimable_kb, parse_self_cgroup, resolve_cgroup_dir, without_cgroup,
 };
 use pretty_assertions::assert_eq;
 
@@ -51,8 +52,10 @@ fn enforcement(memory: MemoryEnforcement, headroom: u64) -> ResourceEnforcementC
         disk: DiskEnforcement::None,
         disk_property_name: "disk_kb".to_string(),
         memory_property_name: "memory_kb".to_string(),
+        memory_request_property_name: "memory_kb".to_string(),
         memory_headroom_percent: headroom,
         disk_headroom_percent: 20,
+        memory_pressure: None,
     }
 }
 
@@ -508,4 +511,126 @@ fn only_an_own_limit_with_readable_usage_counts_as_limited() {
         dir,
         files(Some("25769803776\n"), None)
     ));
+}
+
+/// A cgroup v2 `memory.stat` as a 5.18+ kernel writes it (trimmed), with
+/// 6 GiB of anon, 512 MiB of shmem, 256 MiB of kernel, 16 MiB of sockets,
+/// 64 MiB dirty and 32 MiB under writeback, beside 9 GiB of page cache.
+const MEMORY_STAT: &str = "anon 6442450944
+file 9663676416
+kernel 268435456
+kernel_stack 8388608
+pagetables 33554432
+sec_pagetables 0
+percpu 1048576
+sock 16777216
+vmalloc 0
+shmem 536870912
+file_mapped 104857600
+file_dirty 67108864
+file_writeback 33554432
+anon_thp 0
+inactive_anon 0
+active_anon 6442450944
+inactive_file 7516192768
+active_file 2147483648
+slab_reclaimable 167772160
+slab_unreclaimable 50331648
+slab 218103808
+";
+
+#[test]
+fn unreclaimable_memory_sums_what_the_kernel_cannot_drop() {
+    // anon + shmem + kernel + sock; the page cache is left out, dirty pages
+    // included.
+    assert_eq!(
+        parse_memory_stat_unreclaimable_kb(MEMORY_STAT),
+        Some((6_442_450_944 + 536_870_912 + 268_435_456 + 16_777_216) / 1024)
+    );
+}
+
+#[test]
+fn unreclaimable_memory_before_the_kernel_line_sums_its_parts() {
+    // A kernel before 5.18: no `kernel` line, so its parts are added.
+    let older = MEMORY_STAT
+        .lines()
+        .filter(|line| !line.starts_with("kernel "))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert_eq!(
+        parse_memory_stat_unreclaimable_kb(&older),
+        Some(
+            (6_442_450_944
+                + 536_870_912
+                + (8_388_608 + 33_554_432 + 1_048_576 + 50_331_648)
+                + 16_777_216)
+                / 1024
+        )
+    );
+}
+
+#[test]
+fn unreclaimable_memory_needs_an_anon_line() {
+    assert_eq!(parse_memory_stat_unreclaimable_kb("file 4096\n"), None);
+    assert_eq!(parse_memory_stat_unreclaimable_kb(""), None);
+    // `anon_thp` is not `anon`.
+    assert_eq!(parse_memory_stat_unreclaimable_kb("anon_thp 4096\n"), None);
+    assert_eq!(parse_memory_stat_unreclaimable_kb("anon 4096\n"), Some(4));
+}
+
+#[test]
+fn oom_kill_count_comes_from_memory_events() {
+    let events = "low 0\nhigh 12\nmax 340\noom 3\noom_kill 2\noom_group_kill 0\n";
+    assert_eq!(parse_memory_events_oom_kill(events), Some(2));
+    // `oom_group_kill` is not `oom_kill`.
+    assert_eq!(
+        parse_memory_events_oom_kill("oom_group_kill 4\noom 1\n"),
+        None
+    );
+    assert_eq!(parse_memory_events_oom_kill(""), None);
+}
+
+#[test]
+fn limited_cgroup_reads_its_own_stat_and_events() {
+    let cgroup = LimitedCgroup::from_limit((PathBuf::from("/cg/pod"), "19327352832\n".to_string()))
+        .expect("a byte limit");
+    assert_eq!(cgroup.limit_kb, 18 * 1024 * 1024);
+    let read = |path: &Path| match path.to_str()? {
+        "/cg/pod/memory.stat" => Some(MEMORY_STAT.to_string()),
+        "/cg/pod/memory.events" => Some("oom 1\noom_kill 7\n".to_string()),
+        _ => None,
+    };
+    assert_eq!(
+        cgroup.unreclaimable_kb(read),
+        parse_memory_stat_unreclaimable_kb(MEMORY_STAT)
+    );
+    assert_eq!(cgroup.oom_kills(read), Some(7));
+    assert_eq!(cgroup.oom_kills(|_: &Path| None), None);
+    assert_eq!(
+        LimitedCgroup::from_limit((PathBuf::from("/cg"), "max\n".to_string())),
+        None
+    );
+}
+
+/// The kill line is the limit plus headroom, capped at the worker's room
+/// when it is known, so the whole-worker step's line is never past the
+/// cgroup's own limit.
+#[test]
+fn kill_line_is_limit_plus_headroom_capped_at_the_room() {
+    let gib: u64 = 1024 * 1024;
+    // 18 GiB pod keeping 3 GiB: 15 GiB of room.
+    let room = memory_room_kb(18 * gib, 3 * gib);
+    assert_eq!(room, 15 * gib);
+    // An 8 GiB limit at 20%: 9.6 GiB, under the room.
+    assert_eq!(
+        memory_kill_line_kb(8 * gib, 20, Some(room)),
+        8 * gib * 120 / 100
+    );
+    // The whole worker at 20% would be 18 GiB, the pod's own limit: capped.
+    assert_eq!(memory_kill_line_kb(15 * gib, 20, Some(room)), room);
+    // No room known: no cap.
+    assert_eq!(memory_kill_line_kb(15 * gib, 20, None), 18 * gib);
+    assert_eq!(memory_kill_line_kb(1000, 0, Some(5000)), 1000);
+    // Overhead past the limit leaves no room, never an underflow.
+    assert_eq!(memory_room_kb(gib, 2 * gib), 0);
 }

@@ -410,7 +410,8 @@ where
 /// How often an action is queued again, by cause, before the scheduler
 /// completes it with `FailedPrecondition`. Each cause has its own budget:
 /// an action's own failures, the workers it lost through no fault of its
-/// own, and the memory escalations it was granted.
+/// own, the memory escalations it was granted, and the kills a worker made
+/// to relieve memory pressure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetryLimits {
     /// Internal errors and timeouts the action produced.
@@ -419,14 +420,19 @@ pub struct RetryLimits {
     pub max_worker_loss_retries: usize,
     /// Memory escalations; 0 leaves only the fleet's ceiling to bound them.
     pub max_escalations: usize,
+    /// Kills under memory pressure on the worker as a whole.
+    pub max_pressure_retries: usize,
 }
 
 impl RetryLimits {
     /// Lost workers allowed by default; the action did nothing wrong.
     pub const DEFAULT_WORKER_LOSS_RETRIES: usize = 10;
+    /// Pressure kills allowed by default. A requeued action is booked at
+    /// its limit and spared by the guard, so a second kill is rare.
+    pub const DEFAULT_PRESSURE_RETRIES: usize = 3;
 }
 
-/// Only the job budget stated: the other two take their defaults, which is
+/// Only the job budget stated: the others take their defaults, which is
 /// what older callers meant.
 impl From<usize> for RetryLimits {
     fn from(max_job_retries: usize) -> Self {
@@ -434,6 +440,7 @@ impl From<usize> for RetryLimits {
             max_job_retries,
             max_worker_loss_retries: Self::DEFAULT_WORKER_LOSS_RETRIES,
             max_escalations: 0,
+            max_pressure_retries: Self::DEFAULT_PRESSURE_RETRIES,
         }
     }
 }
@@ -467,6 +474,9 @@ where
         help = "Maximum number of memory escalations for a job; 0 leaves the ceiling to bound them"
     )]
     max_escalations: usize,
+
+    #[metric(help = "Maximum number of times a job is queued again after a memory-pressure kill")]
+    max_pressure_retries: usize,
 
     /// Duration after which an action is considered to be timed out if
     /// no event is received.
@@ -520,12 +530,14 @@ where
             max_job_retries,
             max_worker_loss_retries,
             max_escalations,
+            max_pressure_retries,
         } = retry_limits.into();
         Arc::new_cyclic(|weak_self| Self {
             action_db,
             max_job_retries,
             max_worker_loss_retries,
             max_escalations,
+            max_pressure_retries,
             no_event_action_timeout,
             client_action_timeout,
             max_executing_timeout,
@@ -1028,6 +1040,7 @@ where
             UpdateOperationType::ExecutionComplete => "ExecutionComplete",
             UpdateOperationType::UpdateWithDecline(_) => "Decline",
             UpdateOperationType::UpdateWithEscalation(_) => "Escalation",
+            UpdateOperationType::UpdateWithPressureRequeue(_) => "PressureRequeue",
         };
 
         debug!(
@@ -1249,12 +1262,59 @@ where
                         action_info
                             .platform_properties
                             .insert(escalation.property.clone(), escalation.value.to_string());
+                        if let Some(limit_property) = &escalation.limit_property {
+                            action_info
+                                .platform_properties
+                                .insert(limit_property.clone(), escalation.value.to_string());
+                        }
                         if let Some((cpu_property, cpu_value)) = &escalation.cpu {
                             action_info
                                 .platform_properties
                                 .insert(cpu_property.clone(), cpu_value.to_string());
                         }
                         awaited_action.set_action_info(Arc::new(action_info));
+                        is_retry = true;
+                        ActionStage::Queued
+                    }
+                }
+                UpdateOperationType::UpdateWithPressureRequeue(requeue) => {
+                    // The worker ran short as a whole and chose this action
+                    // to free room: not the action's failure and not a size
+                    // it outgrew, so neither budget above is spent. Its own
+                    // budget stops an action the fleet cannot keep in memory
+                    // from cycling for ever.
+                    awaited_action.pressure_retries += 1;
+                    if awaited_action.pressure_retries > self.max_pressure_retries {
+                        ActionStage::Completed(ActionResult {
+                            execution_metadata: ExecutionMetadata {
+                                worker: maybe_worker_id
+                                    .map_or_else(String::default, ToString::to_string),
+                                ..ExecutionMetadata::default()
+                            },
+                            error: Some(
+                                make_err!(
+                                    Code::FailedPrecondition,
+                                    "Job cancelled after its worker killed it under memory pressure {} times, more than max_pressure_retries ({}); the worker could not keep it in memory alongside its other actions. Give the pool more memory or the action a larger request {}",
+                                    awaited_action.pressure_retries,
+                                    self.max_pressure_retries,
+                                    format!("for operation_id: {operation_id}, maybe_worker_id: {maybe_worker_id:?}"),
+                                )
+                                .merge(requeue.reason.clone()),
+                            ),
+                            ..ActionResult::default()
+                        })
+                    } else {
+                        // Booked at its kill line from here on, so the
+                        // worker's pressure guard spares it next time.
+                        if !requeue.raise.is_empty() {
+                            let mut action_info = (**awaited_action.action_info()).clone();
+                            for (property, value) in &requeue.raise {
+                                action_info
+                                    .platform_properties
+                                    .insert(property.clone(), value.to_string());
+                            }
+                            awaited_action.set_action_info(Arc::new(action_info));
+                        }
                         is_retry = true;
                         ActionStage::Queued
                     }

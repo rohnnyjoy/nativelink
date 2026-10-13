@@ -48,10 +48,16 @@ pub struct StubReport {
     /// How many processes were still running, or waiting to be reaped, when
     /// the action's own process exited.
     pub stragglers: u32,
+    /// How many processes of the action's tree, other than its own, died by
+    /// SIGKILL while it ran: the kernel's OOM killer taking one under the
+    /// root (the root then ends on its own, often 137), which the worker
+    /// reads with the cgroup's OOM count to tell pressure from the action's
+    /// own failure. The stub's own kills at the end are not counted.
+    pub sigkilled: u32,
 }
 
-/// The report's size on the pipe: two little-endian `u64`s and a `u32`.
-pub const REPORT_LEN: usize = 20;
+/// The report's size on the pipe: two little-endian `u64`s and two `u32`s.
+pub const REPORT_LEN: usize = 24;
 
 impl StubReport {
     pub fn to_bytes(self) -> [u8; REPORT_LEN] {
@@ -59,6 +65,7 @@ impl StubReport {
         bytes[0..8].copy_from_slice(&self.user_cpu_us.to_le_bytes());
         bytes[8..16].copy_from_slice(&self.system_cpu_us.to_le_bytes());
         bytes[16..20].copy_from_slice(&self.stragglers.to_le_bytes());
+        bytes[20..24].copy_from_slice(&self.sigkilled.to_le_bytes());
         bytes
     }
 
@@ -68,12 +75,16 @@ impl StubReport {
             word.copy_from_slice(&bytes[at..at + 8]);
             u64::from_le_bytes(word)
         };
-        let mut stragglers = [0u8; 4];
-        stragglers.copy_from_slice(&bytes[16..20]);
+        let u32_at = |at: usize| {
+            let mut word = [0u8; 4];
+            word.copy_from_slice(&bytes[at..at + 4]);
+            u32::from_le_bytes(word)
+        };
         Self {
             user_cpu_us: u64_at(0),
             system_cpu_us: u64_at(8),
-            stragglers: u32::from_le_bytes(stragglers),
+            stragglers: u32_at(16),
+            sigkilled: u32_at(20),
         }
     }
 
@@ -259,7 +270,12 @@ fn micros(time: libc::timeval) -> u64 {
 
 /// Writes the report and exits as the action did: with its exit code, or by
 /// the signal that killed it.
-fn report_and_exit(report_fd: libc::c_int, status: libc::c_int, stragglers: u32) -> ! {
+fn report_and_exit(
+    report_fd: libc::c_int,
+    status: libc::c_int,
+    stragglers: u32,
+    sigkilled: u32,
+) -> ! {
     let mut usage = core::mem::MaybeUninit::<libc::rusage>::zeroed();
     // SAFETY: usage is on the stack; getrusage only writes it, and a failed
     // call leaves the zeroes, which report no CPU.
@@ -270,6 +286,7 @@ fn report_and_exit(report_fd: libc::c_int, status: libc::c_int, stragglers: u32)
         user_cpu_us: micros(usage.ru_utime),
         system_cpu_us: micros(usage.ru_stime),
         stragglers,
+        sigkilled,
     }
     .to_bytes();
     // SAFETY: bytes is on the stack. A short or failed write leaves the
@@ -292,6 +309,34 @@ fn report_and_exit(report_fd: libc::c_int, status: libc::c_int, stragglers: u32)
     exit(libc::WEXITSTATUS(status));
 }
 
+/// Sets this process's `oom_score_adj` to 1000, the most a process can ask
+/// to be the kernel's first choice. Called before the stub forks the
+/// action, so the stub, the action and everything the action starts
+/// inherit it: when the cgroup runs out of memory despite the worker's own
+/// kills, the kernel takes an action's process and never the worker, which
+/// would lose every action it holds. Raising the score needs no privilege.
+/// A failure (no `/proc`, a read-only mount) leaves the score as it was.
+fn prefer_for_oom_kill() {
+    const MOST_PREFERRED: &[u8] = b"1000";
+    // SAFETY: open with a static path and integer flags is
+    // async-signal-safe.
+    let fd = unsafe {
+        libc::open(
+            c"/proc/self/oom_score_adj".as_ptr(),
+            libc::O_WRONLY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return;
+    }
+    // SAFETY: the buffer is static and its length is passed; write and
+    // close are async-signal-safe, and a failed write changes nothing.
+    unsafe {
+        libc::write(fd, MOST_PREFERRED.as_ptr().cast(), MOST_PREFERRED.len());
+        libc::close(fd);
+    }
+}
+
 /// Forks the action under a stub. For `pre_exec`, after any namespace has
 /// been entered: in the child, which goes on to exec the action, it
 /// returns `Ok`; the parent becomes the stub and never returns.
@@ -307,6 +352,7 @@ fn report_and_exit(report_fd: libc::c_int, status: libc::c_int, stragglers: u32)
 /// Only in `pre_exec`. `report_fd` is the write end of a [`ReportPipe`],
 /// or -1 for no report.
 pub unsafe fn fork_stub(report_fd: libc::c_int) -> Result<(), Error> {
+    prefer_for_oom_kill();
     // SAFETY: We are in pre_exec, an async-signal-safe context, and stay
     // in it.
     match unsafe { libc::fork() } {
@@ -333,6 +379,9 @@ pub unsafe fn fork_stub(report_fd: libc::c_int) -> Result<(), Error> {
                 libc::sigprocmask(libc::SIG_BLOCK, sigset.as_ptr(), core::ptr::null_mut());
             }
 
+            // Processes under the action's own that died by SIGKILL while
+            // it ran (the report says what for).
+            let mut sigkilled = 0u32;
             loop {
                 // Reap whatever has exited; the action's own process ends
                 // the action.
@@ -342,7 +391,11 @@ pub unsafe fn fork_stub(report_fd: libc::c_int) -> Result<(), Error> {
                     let res = unsafe { libc::waitpid(-1, &raw mut status, libc::WNOHANG) };
                     if res == pid {
                         let stragglers = terminate_and_wait_for_all();
-                        report_and_exit(report_fd, status, stragglers);
+                        report_and_exit(report_fd, status, stragglers, sigkilled);
+                    } else if res > 0 {
+                        if libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGKILL {
+                            sigkilled = sigkilled.saturating_add(1);
+                        }
                     } else if res == 0 {
                         break;
                     } else if res < 0 {

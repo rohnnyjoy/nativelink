@@ -23,6 +23,14 @@ pub struct WorkerLoad {
     /// / kernel can drop at once), or MemAvailable without a limit.
     #[prost(uint64, tag = "1")]
     pub free_memory_kb: u64,
+    /// / Memory the running actions are still expected to take, in KiB: the
+    /// / sum over them of what each reserved less what it uses now, where the
+    /// / reservation is the larger. An action just started has used nothing
+    /// / of its reservation yet, so free memory alone overstates what a
+    /// / worker can take; a scheduler that packs by expected use subtracts
+    /// / this. Zero where the worker does not sample.
+    #[prost(uint64, tag = "2")]
+    pub owed_kb: u64,
 }
 /// / Request object for keep alive requests.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
@@ -76,6 +84,14 @@ pub struct ConnectWorkerRequest {
     /// / (false) from older workers.
     #[prost(bool, tag = "4")]
     pub admits_when_idle: bool,
+    /// / The worker guards its memory as a whole: it runs a pressure guard
+    /// / against a cgroup the kernel's OOM killer takes one process of, so an
+    /// / action may be booked on it by a request below its kill limit. A
+    /// / scheduler that books requests charges the limit instead on a worker
+    /// / that does not say so (one with no guard, one whose cgroup the kernel
+    /// / would take whole, or an older worker), so it is never overcommitted.
+    #[prost(bool, tag = "5")]
+    pub memory_guarded: bool,
 }
 /// / The result of an ExecutionRequest.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -405,6 +421,12 @@ pub enum ResourceOutcome {
     KilledTimeout = 4,
     /// / Killed from outside: a scheduler cancel, or a signal nobody here sent.
     KilledExternal = 5,
+    /// / Killed to relieve the worker's memory as a whole, by the worker's
+    /// / pressure guard or by the kernel's OOM killer taking this one
+    /// / process, while the action itself was within its own reservation.
+    /// / Not the action's fault and not a sizing fact: its peak is a
+    /// / lower bound cut short.
+    KilledPressure = 6,
 }
 impl ResourceOutcome {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -419,6 +441,7 @@ impl ResourceOutcome {
             Self::KilledDisk => "KILLED_DISK",
             Self::KilledTimeout => "KILLED_TIMEOUT",
             Self::KilledExternal => "KILLED_EXTERNAL",
+            Self::KilledPressure => "KILLED_PRESSURE",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -430,6 +453,7 @@ impl ResourceOutcome {
             "KILLED_DISK" => Some(Self::KilledDisk),
             "KILLED_TIMEOUT" => Some(Self::KilledTimeout),
             "KILLED_EXTERNAL" => Some(Self::KilledExternal),
+            "KILLED_PRESSURE" => Some(Self::KilledPressure),
             _ => None,
         }
     }

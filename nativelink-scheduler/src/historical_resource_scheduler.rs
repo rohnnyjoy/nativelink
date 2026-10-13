@@ -70,6 +70,10 @@ struct HistoricalResourceHint {
     memory_kb: Option<u64>,
     #[serde(default)]
     memory_mib: Option<u64>,
+    /// The kill line's base, beside `memory_kb` as the request. Read only
+    /// with `memory_limit_property_name` set; absent means `memory_kb`.
+    #[serde(default)]
+    memory_limit_kb: Option<u64>,
     #[serde(default)]
     disk_kb: Option<u64>,
     #[serde(default)]
@@ -155,19 +159,24 @@ struct HintState {
 }
 
 /// The numbers an action leaves `add_action` with, before they become
-/// minimum properties. Zero means the dimension is not set.
+/// properties. Zero means the dimension is not set. `memory_kb` is the
+/// request and `memory_limit_kb` the limit, which only a configured
+/// `memory_limit_property_name` carries to the action.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct Numbers {
     cpu_count: u64,
     memory_kb: u64,
+    memory_limit_kb: u64,
     disk_kb: u64,
 }
 
+/// A class books its memory at its kill line: request and limit are one.
 impl From<&SizeClassSpec> for Numbers {
     fn from(class: &SizeClassSpec) -> Self {
         Self {
             cpu_count: class.cpu_count,
             memory_kb: class.memory_kb,
+            memory_limit_kb: class.memory_kb,
             disk_kb: class.disk_kb,
         }
     }
@@ -213,6 +222,7 @@ pub struct HistoricalResourceScheduler {
     refresh_interval: Duration,
     cpu_property_name: String,
     memory_property_name: String,
+    memory_limit_property_name: Option<String>,
     disk_property_name: String,
     reserved: Reserved,
     cold_start: Numbers,
@@ -232,6 +242,10 @@ impl core::fmt::Debug for HistoricalResourceScheduler {
             .field("refresh_interval", &self.refresh_interval)
             .field("cpu_property_name", &self.cpu_property_name)
             .field("memory_property_name", &self.memory_property_name)
+            .field(
+                "memory_limit_property_name",
+                &self.memory_limit_property_name,
+            )
             .field("cold_start", &self.cold_start)
             .field("classes", &self.classes)
             .field("default_class", &self.default_class)
@@ -251,6 +265,7 @@ impl HistoricalResourceScheduler {
             refresh_interval: Duration::from_secs(spec.refresh_interval_s),
             cpu_property_name: spec.cpu_property_name.clone(),
             memory_property_name: spec.memory_property_name.clone(),
+            memory_limit_property_name: spec.memory_limit_property_name.clone(),
             disk_property_name: spec.disk_property_name.clone(),
             reserved: Reserved::from_spec(spec),
             cold_start: spec
@@ -259,6 +274,7 @@ impl HistoricalResourceScheduler {
                 .map_or_else(Numbers::default, |c| Numbers {
                     cpu_count: c.cpu_count,
                     memory_kb: c.memory_kb,
+                    memory_limit_kb: c.memory_kb,
                     disk_kb: c.disk_kb,
                 }),
             classes: spec.classes.clone(),
@@ -351,6 +367,7 @@ impl HistoricalResourceScheduler {
                 if !self.reserved.memory {
                     hint.memory_kb = None;
                     hint.memory_mib = None;
+                    hint.memory_limit_kb = None;
                 }
                 if !self.reserved.disk {
                     hint.disk_kb = None;
@@ -450,7 +467,8 @@ impl HistoricalResourceScheduler {
     }
 
     /// A hint's numbers: what it states, with its class filling anything
-    /// it leaves out. An unknown class was dropped at load.
+    /// it leaves out. An unknown class was dropped at load. The limit is
+    /// the hint's own, else the request, and never below the request.
     fn numbers_from_hint(&self, hint: &HistoricalResourceHint) -> Numbers {
         let from_class = hint
             .class
@@ -458,10 +476,35 @@ impl HistoricalResourceScheduler {
             .and_then(|name| self.class(name))
             .map(Numbers::from)
             .unwrap_or_default();
+        let memory_kb = hint.memory_kb().unwrap_or(from_class.memory_kb);
         Numbers {
             cpu_count: hint.cpu_count.unwrap_or(from_class.cpu_count),
-            memory_kb: hint.memory_kb().unwrap_or(from_class.memory_kb),
+            memory_kb,
+            memory_limit_kb: hint.memory_limit_kb.unwrap_or(memory_kb).max(memory_kb),
             disk_kb: hint.disk_kb.unwrap_or(from_class.disk_kb),
+        }
+    }
+
+    /// With `memory_limit_property_name` set, the limit the action leaves
+    /// with: `limit_kb` (the hint's or the class's, 0 for none), raised to
+    /// whatever the action already carries and to its request, so a request
+    /// the client set above it is never left past its own kill line.
+    fn apply_limit(&self, action_info: &mut ActionInfo, limit_kb: u64) {
+        let Some(limit_property) = &self.memory_limit_property_name else {
+            return;
+        };
+        let properties = &mut action_info.platform_properties;
+        let current = |name: &str| {
+            properties
+                .get(name)
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(0)
+        };
+        let limit_kb = limit_kb
+            .max(current(limit_property))
+            .max(current(&self.memory_property_name));
+        if limit_kb > 0 {
+            properties.insert(limit_property.clone(), limit_kb.to_string());
         }
     }
 
@@ -483,6 +526,7 @@ impl HistoricalResourceScheduler {
             &self.disk_property_name,
             numbers.disk_kb,
         );
+        self.apply_limit(action_info, numbers.memory_limit_kb);
     }
 
     /// The cold-start policy for an action no hint matched: a class by
@@ -555,6 +599,13 @@ impl HistoricalResourceScheduler {
             &self.disk_property_name,
             numbers.disk_kb,
         );
+        // A limit the client set stands; the request is the floor.
+        let limit_kb = self
+            .memory_limit_property_name
+            .as_ref()
+            .filter(|name| !action_info.platform_properties.contains_key(*name))
+            .map_or(0, |_| numbers.memory_limit_kb);
+        self.apply_limit(action_info, limit_kb);
     }
 
     async fn inner_get_known_properties(&self, instance_name: &str) -> Result<Vec<String>, Error> {
@@ -576,6 +627,9 @@ impl HistoricalResourceScheduler {
         known_properties.insert(self.cpu_property_name.clone());
         known_properties.insert(self.memory_property_name.clone());
         known_properties.insert(self.disk_property_name.clone());
+        if let Some(limit_property) = &self.memory_limit_property_name {
+            known_properties.insert(limit_property.clone());
+        }
         let final_known_properties: Vec<String> = known_properties.into_iter().collect();
         self.known_properties
             .lock()
@@ -644,6 +698,10 @@ impl ClientStateManager for HistoricalResourceScheduler {
         } else {
             let numbers = self.cold_start_numbers(&action_info, action_mnemonic.as_ref());
             if numbers == Numbers::default() {
+                // A request the client set still gets a limit beside it.
+                if self.memory_limit_property_name.is_some() {
+                    self.apply_limit(Arc::make_mut(&mut action_info), 0);
+                }
                 record_hint_resolution("none");
             } else {
                 self.apply_defaults(Arc::make_mut(&mut action_info), numbers);

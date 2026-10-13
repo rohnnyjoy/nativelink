@@ -21,6 +21,7 @@ pub mod local_worker;
 #[cfg(target_os = "linux")]
 pub mod namespace_utils;
 pub mod persistent_worker;
+pub mod pressure;
 #[cfg(target_family = "unix")]
 pub mod process_tree;
 pub mod qos;

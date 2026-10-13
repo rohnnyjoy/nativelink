@@ -50,7 +50,15 @@ message WorkerLoad {
     /// kernel can drop at once), or MemAvailable without a limit.
     uint64 free_memory_kb = 1;
 
-    reserved 2; // NextId.
+    /// Memory the running actions are still expected to take, in KiB: the
+    /// sum over them of what each reserved less what it uses now, where the
+    /// reservation is the larger. An action just started has used nothing
+    /// of its reservation yet, so free memory alone overstates what a
+    /// worker can take; a scheduler that packs by expected use subtracts
+    /// this. Zero where the worker does not sample.
+    uint64 owed_kb = 2;
+
+    reserved 3; // NextId.
 }
 
 /// Request object for keep alive requests.
@@ -101,7 +109,15 @@ message ConnectWorkerRequest {
     /// (false) from older workers.
     bool admits_when_idle = 4;
 
-    reserved 5; // NextId.
+    /// The worker guards its memory as a whole: it runs a pressure guard
+    /// against a cgroup the kernel's OOM killer takes one process of, so an
+    /// action may be booked on it by a request below its kill limit. A
+    /// scheduler that books requests charges the limit instead on a worker
+    /// that does not say so (one with no guard, one whose cgroup the kernel
+    /// would take whole, or an older worker), so it is never overcommitted.
+    bool memory_guarded = 5;
+
+    reserved 6; // NextId.
 }
 
 /// The result of an ExecutionRequest.
@@ -152,6 +168,12 @@ enum ResourceOutcome {
     KILLED_TIMEOUT = 4;
     /// Killed from outside: a scheduler cancel, or a signal nobody here sent.
     KILLED_EXTERNAL = 5;
+    /// Killed to relieve the worker's memory as a whole, by the worker's
+    /// pressure guard or by the kernel's OOM killer taking this one
+    /// process, while the action itself was within its own reservation.
+    /// Not the action's fault and not a sizing fact: its peak is a
+    /// lower bound cut short.
+    KILLED_PRESSURE = 6;
 }
 
 /// The reservation an action was admitted under, echoed by the worker so

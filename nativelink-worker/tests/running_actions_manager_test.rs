@@ -40,8 +40,8 @@ mod tests {
     use bytes::Bytes;
     use futures::prelude::*;
     use nativelink_config::cas_server::{
-        DiskEnforcement, EnvironmentSource, MemoryEnforcement, ResourceEnforcementConfig,
-        UploadActionResultConfig, UploadCacheResultsStrategy,
+        DiskEnforcement, EnvironmentSource, MemoryEnforcement, MemoryPressureConfig,
+        ResourceEnforcementConfig, UploadActionResultConfig, UploadCacheResultsStrategy,
     };
     use nativelink_config::stores::{
         EvictionPolicy, FastSlowSpec, FilesystemSpec, MemorySpec, StoreDirection, StoreSpec,
@@ -95,7 +95,7 @@ mod tests {
     use nativelink_worker::running_actions_manager::{
         Callbacks, ExecutionConfiguration, KillReason, PersistentWorkersSettings,
         ResourceEnforcement, RunningAction, RunningActionImpl, RunningActionsManager,
-        RunningActionsManagerArgs, RunningActionsManagerImpl, classify_outcome,
+        RunningActionsManagerArgs, RunningActionsManagerImpl, TreeEnding, classify_outcome,
         download_to_directory, log_excerpt, parse_kb_field,
     };
     use pretty_assertions::assert_eq;
@@ -2685,6 +2685,7 @@ exit 0
                     buck2_file_capture: None,
                     entrypoint: Some(test_wrapper_script.into_string().unwrap()),
                     additional_environment: None,
+                    memory_room_kb: None,
                 },
                 cas_store: cas_store.clone(),
                 ac_store: Some(Store::new(ac_store.clone())),
@@ -2874,6 +2875,7 @@ exit 0
                             EnvironmentSource::Value(env::var("PATH").unwrap()),
                         ),
                     ])),
+                    memory_room_kb: None,
                 },
                 cas_store: cas_store.clone(),
                 ac_store: Some(Store::new(ac_store.clone())),
@@ -2999,9 +3001,11 @@ exit 0
             memory,
             disk,
             disk_property_name: "disk_kb".to_string(),
-            memory_property_name: "memory_kb".to_string(),
+            memory_property_name: "memory_limit_kb".to_string(),
+            memory_request_property_name: "memory_kb".to_string(),
             memory_headroom_percent: 20,
             disk_headroom_percent: 20,
+            memory_pressure: Some(MemoryPressureConfig::default()),
         };
         assert!(
             ResourceEnforcement::from_config(&config(
@@ -3023,8 +3027,12 @@ exit 0
         ))
         .expect("memory alone is enforcement");
         let memory = memory_only.memory.expect("the memory axis is on");
-        assert_eq!(memory.property_name, "memory_kb");
+        // The kill line reads the limit; the guard and the keepalive read
+        // the request.
+        assert_eq!(memory.property_name, "memory_limit_kb");
+        assert_eq!(memory.request_property_name, "memory_kb");
         assert_eq!(memory.headroom_percent, 20);
+        assert_eq!(memory.pressure, Some(MemoryPressureConfig::default()));
         assert!(memory_only.disk_property_name.is_none());
         Ok(())
     }
@@ -4684,42 +4692,290 @@ exit 0
     /// reason, a SIGKILL near the memory limit as the kernel, anything else
     /// from outside.
     #[nativelink_test]
+    async fn stub_report_round_trips_its_fields() -> Result<(), Box<dyn core::error::Error>> {
+        use nativelink_worker::action_stub::{REPORT_LEN, StubReport};
+        let report = StubReport {
+            user_cpu_us: 1_234_567,
+            system_cpu_us: 89,
+            stragglers: 3,
+            sigkilled: 2,
+        };
+        let bytes = report.to_bytes();
+        assert_eq!(bytes.len(), REPORT_LEN);
+        assert_eq!(StubReport::from_bytes(&bytes), report);
+        assert_eq!(
+            StubReport::from_bytes(&[0u8; REPORT_LEN]),
+            StubReport::default()
+        );
+        Ok(())
+    }
+
+    #[nativelink_test]
     async fn outcome_classification() -> Result<(), Box<dyn core::error::Error>> {
         const SIGKILL: i32 = 9;
         const SIGTERM: i32 = 15;
+        fn ending(signal: Option<i32>, exited_clean: bool, sigkilled: bool) -> TreeEnding {
+            TreeEnding {
+                signal,
+                exit_code: match (signal, exited_clean) {
+                    (Some(_), _) => None,
+                    (None, true) => Some(0),
+                    (None, false) => Some(1),
+                },
+                sigkilled,
+            }
+        }
+        // Exit 137 with the count risen: a kill inside the action's PID
+        // namespace, which the stub never reaps, reported by the wrapper.
         assert_eq!(
-            classify_outcome(None, None, 900, Some(1000)),
+            classify_outcome(
+                None,
+                TreeEnding {
+                    signal: None,
+                    exit_code: Some(137),
+                    sigkilled: false
+                },
+                900,
+                Some(1000),
+                Some(1),
+                Some(2)
+            ),
+            (ResourceOutcome::KilledPressure, false)
+        );
+        assert_eq!(
+            classify_outcome(
+                None,
+                TreeEnding {
+                    signal: None,
+                    exit_code: Some(137),
+                    sigkilled: false
+                },
+                900,
+                Some(1000),
+                Some(2),
+                Some(2)
+            ),
+            (ResourceOutcome::Completed, false)
+        );
+        // The kernel took a process under the action's root while it ran (the
+        // stub counted a descendant dying by SIGKILL) and the root exited 137
+        // on its own: pressure, not the action's failure. The count alone is
+        // the worker's: another action's OOM kill beside this one's own exit 1
+        // leaves this one completed (failed on its own), and a clean exit with
+        // a descendant killed is completed too.
+        assert_eq!(
+            classify_outcome(
+                None,
+                ending(None, false, true),
+                900,
+                Some(1000),
+                Some(1),
+                Some(2)
+            ),
+            (ResourceOutcome::KilledPressure, false)
+        );
+        assert_eq!(
+            classify_outcome(
+                None,
+                ending(None, false, false),
+                900,
+                Some(1000),
+                Some(1),
+                Some(2)
+            ),
             (ResourceOutcome::Completed, false)
         );
         assert_eq!(
-            classify_outcome(Some(KillReason::Memory), None, 0, None),
+            classify_outcome(
+                None,
+                ending(None, true, true),
+                900,
+                Some(1000),
+                Some(1),
+                Some(2)
+            ),
+            (ResourceOutcome::Completed, false)
+        );
+        assert_eq!(
+            classify_outcome(None, ending(None, true, false), 900, Some(1000), None, None),
+            (ResourceOutcome::Completed, false)
+        );
+        assert_eq!(
+            classify_outcome(
+                Some(KillReason::Memory),
+                ending(None, true, false),
+                0,
+                None,
+                None,
+                None
+            ),
             (ResourceOutcome::KilledMemory, true)
         );
         assert_eq!(
-            classify_outcome(Some(KillReason::Timeout), Some(SIGKILL), 999, Some(1000)),
+            classify_outcome(
+                Some(KillReason::Timeout),
+                ending(Some(SIGKILL), true, false),
+                999,
+                Some(1000),
+                None,
+                None
+            ),
             (ResourceOutcome::KilledTimeout, false)
         );
         assert_eq!(
-            classify_outcome(Some(KillReason::External), Some(SIGTERM), 0, None),
+            classify_outcome(
+                Some(KillReason::External),
+                ending(Some(SIGTERM), true, false),
+                0,
+                None,
+                None,
+                None
+            ),
             (ResourceOutcome::KilledExternal, false)
         );
         // The kernel's SIGKILL within 10% of the limit is an OOM kill.
         assert_eq!(
-            classify_outcome(None, Some(SIGKILL), 900, Some(1000)),
+            classify_outcome(
+                None,
+                ending(Some(SIGKILL), true, false),
+                900,
+                Some(1000),
+                None,
+                None
+            ),
             (ResourceOutcome::KilledMemory, false)
         );
         assert_eq!(
-            classify_outcome(None, Some(SIGKILL), 899, Some(1000)),
+            classify_outcome(
+                None,
+                ending(Some(SIGKILL), true, false),
+                899,
+                Some(1000),
+                None,
+                None
+            ),
             (ResourceOutcome::KilledExternal, false)
         );
         // No yardstick, no verdict.
         assert_eq!(
-            classify_outcome(None, Some(SIGKILL), 900, None),
+            classify_outcome(
+                None,
+                ending(Some(SIGKILL), true, false),
+                900,
+                None,
+                None,
+                None
+            ),
             (ResourceOutcome::KilledExternal, false)
         );
         assert_eq!(
-            classify_outcome(None, Some(SIGTERM), 1000, Some(1000)),
+            classify_outcome(
+                None,
+                ending(Some(SIGTERM), true, false),
+                1000,
+                Some(1000),
+                None,
+                None
+            ),
             (ResourceOutcome::KilledExternal, false)
+        );
+        // The cgroup's OOM count rose: the kernel relieved the worker as a
+        // whole, which is pressure, not the action's own fault, near its
+        // limit or not.
+        assert_eq!(
+            classify_outcome(
+                None,
+                ending(Some(SIGKILL), true, false),
+                100,
+                Some(1000),
+                Some(3),
+                Some(4)
+            ),
+            (ResourceOutcome::KilledPressure, false)
+        );
+        assert_eq!(
+            classify_outcome(
+                None,
+                ending(Some(SIGKILL), true, false),
+                950,
+                Some(1000),
+                Some(0),
+                Some(1)
+            ),
+            (ResourceOutcome::KilledPressure, false)
+        );
+        // An unchanged count keeps the near-the-limit rule.
+        assert_eq!(
+            classify_outcome(
+                None,
+                ending(Some(SIGKILL), true, false),
+                950,
+                Some(1000),
+                Some(2),
+                Some(2)
+            ),
+            (ResourceOutcome::KilledMemory, false)
+        );
+        assert_eq!(
+            classify_outcome(
+                None,
+                ending(Some(SIGKILL), true, false),
+                100,
+                Some(1000),
+                Some(2),
+                Some(2)
+            ),
+            (ResourceOutcome::KilledExternal, false)
+        );
+        // One count unread is no evidence.
+        assert_eq!(
+            classify_outcome(
+                None,
+                ending(Some(SIGKILL), true, false),
+                100,
+                Some(1000),
+                None,
+                Some(5)
+            ),
+            (ResourceOutcome::KilledExternal, false)
+        );
+        // A signal other than SIGKILL on the root is never the OOM killer's
+        // own, even with the count risen (another action's kill); with a
+        // descendant of this action killed, the root's SIGTERM ends a run cut
+        // short by pressure.
+        assert_eq!(
+            classify_outcome(
+                None,
+                ending(Some(SIGTERM), false, false),
+                100,
+                Some(1000),
+                Some(0),
+                Some(1)
+            ),
+            (ResourceOutcome::KilledExternal, false)
+        );
+        assert_eq!(
+            classify_outcome(
+                None,
+                ending(Some(SIGTERM), false, true),
+                100,
+                Some(1000),
+                Some(0),
+                Some(1)
+            ),
+            (ResourceOutcome::KilledPressure, false)
+        );
+        // The guard's own kill is enforced, whatever the count did.
+        assert_eq!(
+            classify_outcome(
+                Some(KillReason::Pressure),
+                ending(Some(SIGKILL), true, false),
+                100,
+                Some(1000),
+                Some(0),
+                Some(1)
+            ),
+            (ResourceOutcome::KilledPressure, true)
         );
         Ok(())
     }
@@ -5212,7 +5468,9 @@ exit 0
                     resource_enforcement: Some(ResourceEnforcement {
                         memory: Some(MemoryLimit {
                             property_name: "memory_kb".to_string(),
+                            request_property_name: "memory_kb".to_string(),
                             headroom_percent: 20,
+                            pressure: None,
                         }),
                         disk_property_name: None,
                         disk_soft: false,
@@ -5337,6 +5595,114 @@ exit 0
         Ok(())
     }
 
+    /// The pressure guard's kill: the running command is a candidate with
+    /// its request and limit, the kill is SIGKILL reported as
+    /// `KILLED_PRESSURE` and enforced, and the action stops being a
+    /// candidate the moment it is chosen.
+    #[cfg(target_family = "unix")]
+    #[nativelink_test]
+    async fn pressure_kill_ends_the_command_as_killed_pressure()
+    -> Result<(), Box<dyn core::error::Error>> {
+        const WORKER_ID: &str = "foo_worker_id";
+        let (_, _, cas_store, _ac_store) = setup_stores().await?;
+        let root_action_directory = make_temp_path("root_action_directory");
+        fs::create_dir_all(&root_action_directory).await?;
+        let running_actions_manager = enforcing_manager(
+            &root_action_directory,
+            &cas_store,
+            ExecutionConfiguration {
+                resource_enforcement: Some(ResourceEnforcement {
+                    memory: Some(MemoryLimit {
+                        property_name: "memory_limit_kb".to_string(),
+                        request_property_name: "memory_kb".to_string(),
+                        headroom_percent: 20,
+                        pressure: Some(MemoryPressureConfig::default()),
+                    }),
+                    disk_property_name: None,
+                    disk_soft: false,
+                    disk_headroom_percent: 20,
+                }),
+                ..Default::default()
+            },
+        )
+        .await?;
+        let action_digest = upload_action(
+            &cas_store,
+            &Command {
+                arguments: vec!["sh".to_string(), "-c".to_string(), "sleep 30".to_string()],
+                working_directory: ".".to_string(),
+                environment_variables: vec![EnvironmentVariable {
+                    name: "PATH".to_string(),
+                    value: env::var("PATH").unwrap(),
+                }],
+                ..Default::default()
+            },
+        )
+        .await?;
+        let running_action = running_actions_manager
+            .create_and_add_action(
+                WORKER_ID.to_string(),
+                dispatch_with_properties(
+                    action_digest,
+                    &[
+                        ("memory_kb", "4096".to_string()),
+                        ("memory_limit_kb", "1048576".to_string()),
+                    ],
+                ),
+            )
+            .await?;
+        // Before the command runs it is owed its whole request and is no
+        // candidate.
+        assert_eq!(running_actions_manager.owed_memory_kb(), 4096);
+        assert!(running_actions_manager.pressure_candidates().is_empty());
+
+        let started = std::time::Instant::now();
+        let run = tokio::spawn(run_action(running_action.clone()));
+        let candidate = loop {
+            if let Some(candidate) = running_actions_manager.pressure_candidates().pop() {
+                break candidate;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "the command never became a candidate"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert_eq!(&candidate.operation_id, running_action.get_operation_id());
+        assert_eq!(candidate.request_kb, 4096);
+        assert_eq!(candidate.limit_kb, 1_048_576);
+        assert!(!candidate.is_protected());
+
+        assert!(running_actions_manager.kill_for_pressure(&candidate.operation_id));
+        // Chosen once: no longer a candidate, and a second kill finds nothing.
+        assert!(running_actions_manager.pressure_candidates().is_empty());
+        assert!(!running_actions_manager.kill_for_pressure(&candidate.operation_id));
+
+        let result = run.await??;
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the guard's kill should end the command long before its 30s sleep"
+        );
+        let err = result
+            .error
+            .expect("an action killed for pressure carries an error");
+        assert_eq!(err.code, Code::Unavailable, "{err}");
+        assert!(
+            err.to_string().contains("memory pressure"),
+            "the error should say why: {err}"
+        );
+        let usage = running_action
+            .resource_usage()
+            .expect("usage is reported for every executed action");
+        assert_eq!(
+            usage.outcome,
+            ResourceOutcome::KilledPressure as i32,
+            "{usage:?}"
+        );
+        assert!(usage.enforced, "the worker's guard ended it: {usage:?}");
+        Ok(())
+    }
+
     #[cfg_attr(feature = "nix", ignore)]
     #[nativelink_test]
     async fn entrypoint_sends_timeout_via_side_channel() -> Result<(), Box<dyn core::error::Error>>
@@ -5405,6 +5771,7 @@ exit 1
                         "SIDE_CHANNEL_FILE".to_string(),
                         EnvironmentSource::SideChannelFile,
                     )])),
+                    memory_room_kb: None,
                 },
                 cas_store: cas_store.clone(),
                 ac_store: Some(Store::new(ac_store.clone())),
@@ -8567,6 +8934,7 @@ done
                     buck2_file_capture: None,
                     entrypoint: None,
                     additional_environment: None,
+                    memory_room_kb: None,
                 },
                 cas_store: cas_store.clone(),
                 ac_store: Some(Store::new(ac_store.clone())),
@@ -8721,6 +9089,7 @@ done
                     buck2_file_capture: None,
                     entrypoint: None,
                     additional_environment: None,
+                    memory_room_kb: None,
                 },
                 cas_store: cas_store.clone(),
                 ac_store: Some(Store::new(ac_store.clone())),

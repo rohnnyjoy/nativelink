@@ -1297,6 +1297,7 @@ impl SimpleScheduler {
             max_escalations: spec.memory_escalation.as_ref().map_or(0, |policy| {
                 usize::try_from(policy.max_steps).unwrap_or(usize::MAX)
             }),
+            max_pressure_retries: spec.max_pressure_retries,
         };
         let state_manager = SimpleSchedulerStateManager::new(
             retry_limits,
@@ -1324,6 +1325,7 @@ impl SimpleScheduler {
             record_ttl,
         );
 
+        worker_scheduler.set_live_memory_margin_kb(spec.live_memory_margin_kb);
         let worker_scheduler_clone = worker_scheduler.clone();
 
         let fallback_match_interval = match spec.fallback_match_interval_s {

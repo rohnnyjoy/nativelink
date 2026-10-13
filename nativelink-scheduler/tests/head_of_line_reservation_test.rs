@@ -261,7 +261,10 @@ async fn report(
         .worker_keep_alive_received(
             &WorkerId(worker.to_string()),
             NOW_TIME + at,
-            Some(WorkerLoad { free_memory_kb }),
+            Some(WorkerLoad {
+                free_memory_kb,
+                owed_kb: 0,
+            }),
         )
         .await
 }

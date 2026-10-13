@@ -123,6 +123,7 @@ async fn platform_properties_smoke_test() -> Result<(), Error> {
             ],
             max_inflight_tasks: 0,
             admits_when_idle: memory_is_limited(),
+            memory_guarded: false,
         }
     );
 
@@ -144,6 +145,7 @@ async fn reconnect_on_server_disconnect_test() -> Result<(), Error> {
             props,
             ConnectWorkerRequest {
                 admits_when_idle: memory_is_limited(),
+                memory_guarded: false,
                 ..Default::default()
             }
         );
@@ -163,6 +165,7 @@ async fn reconnect_on_server_disconnect_test() -> Result<(), Error> {
             props,
             ConnectWorkerRequest {
                 admits_when_idle: memory_is_limited(),
+                memory_guarded: false,
                 ..Default::default()
             }
         );
@@ -186,6 +189,7 @@ async fn kill_all_called_on_disconnect() -> Result<(), Error> {
             props,
             ConnectWorkerRequest {
                 admits_when_idle: memory_is_limited(),
+                memory_guarded: false,
                 ..Default::default()
             }
         );
@@ -299,6 +303,7 @@ async fn reconnects_when_action_stuck_in_transit_on_disconnect() -> Result<(), E
         props,
         ConnectWorkerRequest {
             admits_when_idle: memory_is_limited(),
+            memory_guarded: false,
             ..Default::default()
         }
     );
@@ -321,6 +326,7 @@ async fn blake3_digest_function_registered_properly() -> Result<(), Error> {
             props,
             ConnectWorkerRequest {
                 admits_when_idle: memory_is_limited(),
+                memory_guarded: false,
                 ..Default::default()
             }
         );
@@ -440,6 +446,7 @@ async fn start_action_lifecycle_test(single_use: bool) -> Result<(), Error> {
             ConnectWorkerRequest {
                 max_inflight_tasks: u64::from(single_use),
                 admits_when_idle: memory_is_limited(),
+                memory_guarded: false,
                 ..Default::default()
             }
         );
@@ -773,6 +780,7 @@ async fn experimental_precondition_script_fails() -> Result<(), Error> {
             props,
             ConnectWorkerRequest {
                 admits_when_idle: memory_is_limited(),
+                memory_guarded: false,
                 ..Default::default()
             }
         );
@@ -870,6 +878,7 @@ async fn kill_action_request_kills_action() -> Result<(), Error> {
             props,
             ConnectWorkerRequest {
                 admits_when_idle: memory_is_limited(),
+                memory_guarded: false,
                 ..Default::default()
             }
         );
@@ -977,6 +986,7 @@ async fn cas_not_found_returns_failed_precondition_test() -> Result<(), Error> {
             props,
             ConnectWorkerRequest {
                 admits_when_idle: memory_is_limited(),
+                memory_guarded: false,
                 ..Default::default()
             }
         );
@@ -1107,6 +1117,7 @@ async fn non_cas_not_found_returns_internal_error_test() -> Result<(), Error> {
             props,
             ConnectWorkerRequest {
                 admits_when_idle: memory_is_limited(),
+                memory_guarded: false,
                 ..Default::default()
             }
         );
@@ -1245,6 +1256,7 @@ async fn keep_alive_fail_logs() -> Result<(), Error> {
         props,
         ConnectWorkerRequest {
             admits_when_idle: memory_is_limited(),
+            memory_guarded: false,
             ..Default::default()
         }
     );
@@ -1616,6 +1628,7 @@ async fn disconnect_with_action_in_transit(single_use: bool) -> Result<(), Error
             ConnectWorkerRequest {
                 max_inflight_tasks: u64::from(single_use),
                 admits_when_idle: memory_is_limited(),
+                memory_guarded: false,
                 ..Default::default()
             }
         );
@@ -1707,6 +1720,7 @@ async fn disconnect_with_action_in_transit(single_use: bool) -> Result<(), Error
             props,
             ConnectWorkerRequest {
                 admits_when_idle: memory_is_limited(),
+                memory_guarded: false,
                 ..Default::default()
             }
         );

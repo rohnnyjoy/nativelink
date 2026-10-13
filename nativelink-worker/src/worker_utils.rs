@@ -32,6 +32,7 @@ pub async fn make_connect_worker_request<S: BuildHasher>(
     extra_envs: &HashMap<String, String, S>,
     max_inflight_tasks: u64,
     admits_when_idle: bool,
+    memory_guarded: bool,
 ) -> Result<ConnectWorkerRequest, Error> {
     let mut futures = vec![];
     for (property_name, worker_property) in worker_properties {
@@ -111,5 +112,6 @@ pub async fn make_connect_worker_request<S: BuildHasher>(
         properties: try_join_all(futures).await?.into_iter().flatten().collect(),
         max_inflight_tasks,
         admits_when_idle,
+        memory_guarded,
     })
 }

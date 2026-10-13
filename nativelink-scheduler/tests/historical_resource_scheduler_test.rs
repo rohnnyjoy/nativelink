@@ -69,6 +69,7 @@ fn base_spec(hints_file: String, cold_start: Option<ColdStartSpec>) -> Historica
         refresh_interval_s: 0,
         cpu_property_name: "cpu_count".to_string(),
         memory_property_name: "memory_kb".to_string(),
+        memory_limit_property_name: None,
         disk_property_name: "disk_kb".to_string(),
         classes: vec![],
         default_class: None,
@@ -532,6 +533,114 @@ async fn a_rule_naming_no_class_is_refused_and_the_default_class_stands_in() -> 
     assert_eq!(
         properties["memory_kb"], "4000000",
         "the default class, not nothing"
+    );
+    drop(fs::remove_file(hints_file));
+    Ok(())
+}
+
+/// With `memory_limit_property_name` set, a hint's `memory_kb` is the
+/// request and its `memory_limit_kb` the limit, each on its own property; a
+/// hint with no limit gets its request as the limit. A request the client
+/// set is never lowered, and the limit is never left below it.
+#[nativelink_test]
+async fn a_hint_sets_the_request_and_the_limit_apart() -> Result<(), Error> {
+    let hints_file = write_hints_file(
+        r#"[
+            { "target_id": "//pkg:split", "memory_kb": 2000000, "memory_limit_kb": 6000000 },
+            { "target_id": "//pkg:one", "memory_kb": 3000000 }
+        ]"#,
+    );
+    let mut spec = base_spec(hints_file.clone(), None);
+    spec.memory_limit_property_name = Some("memory_limit_kb".to_string());
+    let (mock_scheduler, scheduler) = make_scheduler_with_spec(&spec);
+    let base = make_base_action_info(UNIX_EPOCH, DigestInfo::zero_digest());
+
+    let properties = properties_after_add(
+        &scheduler,
+        &mock_scheduler,
+        base.clone(),
+        Some(("//pkg:split", "TestRunner")),
+    )
+    .await?;
+    assert_eq!(properties["memory_kb"], "2000000", "the request");
+    assert_eq!(properties["memory_limit_kb"], "6000000", "the limit");
+
+    let properties = properties_after_add(
+        &scheduler,
+        &mock_scheduler,
+        base.clone(),
+        Some(("//pkg:one", "TestRunner")),
+    )
+    .await?;
+    assert_eq!(properties["memory_kb"], "3000000");
+    assert_eq!(
+        properties["memory_limit_kb"], "3000000",
+        "no limit in the hint: the limit is the request"
+    );
+
+    // The client asked for more than the hint's limit: its request stands
+    // and the limit follows it up.
+    let mut tagged = (*base).clone();
+    tagged
+        .platform_properties
+        .insert("memory_kb".to_string(), "9000000".to_string());
+    let properties = properties_after_add(
+        &scheduler,
+        &mock_scheduler,
+        Arc::new(tagged),
+        Some(("//pkg:split", "TestRunner")),
+    )
+    .await?;
+    assert_eq!(properties["memory_kb"], "9000000");
+    assert_eq!(properties["memory_limit_kb"], "9000000");
+    drop(fs::remove_file(hints_file));
+    Ok(())
+}
+
+/// A class (here the default one, for an action no hint matches) books its
+/// memory at its kill line: request and limit are both the class's memory.
+#[nativelink_test]
+async fn a_cold_class_sets_the_request_and_the_limit_alike() -> Result<(), Error> {
+    let hints_file = write_hints_file("[]");
+    let mut spec = base_spec(hints_file.clone(), None);
+    spec.memory_limit_property_name = Some("memory_limit_kb".to_string());
+    spec.classes = vec![class("s", 1000, 4_000_000, 0)];
+    spec.default_class = Some("s".to_string());
+    let (mock_scheduler, scheduler) = make_scheduler_with_spec(&spec);
+    let action = make_base_action_info(UNIX_EPOCH, DigestInfo::zero_digest());
+    let properties = properties_after_add(
+        &scheduler,
+        &mock_scheduler,
+        action,
+        Some(("//pkg:cold", "Javac")),
+    )
+    .await?;
+    assert_eq!(properties["memory_kb"], "4000000");
+    assert_eq!(properties["memory_limit_kb"], "4000000");
+    drop(fs::remove_file(hints_file));
+    Ok(())
+}
+
+/// Without `memory_limit_property_name` nothing changes: a hint's
+/// `memory_limit_kb` is not read, and the one memory number is all the
+/// action carries.
+#[nativelink_test]
+async fn without_a_limit_property_one_number_is_set_as_before() -> Result<(), Error> {
+    let hints_file = write_hints_file(
+        r#"[ { "target_id": "//pkg:split", "memory_kb": 2000000, "memory_limit_kb": 6000000 } ]"#,
+    );
+    let (mock_scheduler, scheduler) = make_scheduler(hints_file.clone());
+    let action = make_base_action_info(UNIX_EPOCH, DigestInfo::zero_digest());
+    let properties = properties_after_add(
+        &scheduler,
+        &mock_scheduler,
+        action,
+        Some(("//pkg:split", "TestRunner")),
+    )
+    .await?;
+    assert_eq!(
+        properties,
+        HashMap::from([("memory_kb".to_string(), "2000000".to_string())])
     );
     drop(fs::remove_file(hints_file));
     Ok(())

@@ -80,6 +80,7 @@ fn make_scheduler_with_limits(
             ladder_kb,
             cpu_property: "cpu_count".to_string(),
             max_steps,
+            limit_property: None,
         }),
         max_job_retries,
         max_worker_loss_retries: 2,
@@ -404,5 +405,219 @@ async fn escalation_steps_the_ladder_then_takes_the_whole_worker() -> Result<(),
     let err = result.error.expect("nothing above the whole worker");
     assert_eq!(err.code, Code::FailedPrecondition, "{err}");
     assert!(err.to_string().contains("no worker can run it"), "{err}");
+    Ok(())
+}
+
+/// A scheduler whose actions carry a request (`memory_kb`, packed) and a
+/// limit (`memory_limit_kb`, passed to the worker and never packed), as the
+/// `historical_resource` layer sets them with `memory_limit_property_name`.
+fn make_split_scheduler(
+    max_job_retries: usize,
+    ladder_kb: Vec<u64>,
+    max_pressure_retries: usize,
+) -> (Arc<SimpleScheduler>, Arc<dyn WorkerScheduler>) {
+    MockClock::set_time(Duration::from_secs(NOW_TIME));
+    let task_change_notify = Arc::new(Notify::new());
+    let spec = SimpleSpec {
+        supported_platform_properties: Some(HashMap::from([
+            ("memory_kb".to_string(), PropertyType::Minimum),
+            ("memory_limit_kb".to_string(), PropertyType::Ignore),
+        ])),
+        memory_escalation: Some(MemoryEscalationSpec {
+            property: "memory_kb".to_string(),
+            percent: 200,
+            max_kb: 0,
+            ladder_kb,
+            cpu_property: "cpu_count".to_string(),
+            max_steps: 0,
+            limit_property: Some("memory_limit_kb".to_string()),
+        }),
+        max_job_retries,
+        max_pressure_retries,
+        ..SimpleSpec::default()
+    };
+    SimpleScheduler::new_with_callback(
+        &spec,
+        memory_awaited_action_db_factory(
+            0,
+            &task_change_notify,
+            MockInstantWrapped::default,
+            ActiveCountAttributes::default(),
+        ),
+        || async move {},
+        task_change_notify,
+        MockInstantWrapped::default,
+        None,
+    )
+}
+
+/// The request and the limit a dispatch carries.
+async fn next_split_dispatch(rx: &mut mpsc::Receiver<UpdateForWorker>) -> (String, u64, u64) {
+    let (start_execute, request_kb) = next_dispatch(rx).await;
+    let limit_kb = start_execute
+        .platform
+        .as_ref()
+        .and_then(|platform| {
+            platform
+                .properties
+                .iter()
+                .find(|p| p.name == "memory_limit_kb")
+                .and_then(|p| p.value.parse().ok())
+        })
+        .expect("the dispatch carries memory_limit_kb");
+    (start_execute.operation_id, request_kb, limit_kb)
+}
+
+async fn add_split_action(
+    scheduler: &SimpleScheduler,
+    digest_byte: u8,
+    request_kb: u64,
+    limit_kb: u64,
+) -> Result<Box<dyn ActionStateResult>, Error> {
+    let base = make_base_action_info(
+        UNIX_EPOCH + MockClock::time(),
+        DigestInfo::new([digest_byte; 32], 512),
+    );
+    let action_info = Arc::new(ActionInfo {
+        platform_properties: HashMap::from([
+            ("memory_kb".to_string(), request_kb.to_string()),
+            ("memory_limit_kb".to_string(), limit_kb.to_string()),
+        ]),
+        ..(*base).clone()
+    });
+    let listener = scheduler
+        .add_action(OperationId::default(), action_info)
+        .await?;
+    tokio::task::yield_now().await;
+    Ok(listener)
+}
+
+/// What a worker sends when its pressure guard (or the kernel) killed the
+/// action to relieve the worker as a whole: the usage report, then the
+/// result. The worker echoes the limit it enforced.
+async fn report_pressure_kill(
+    worker_scheduler: &dyn WorkerScheduler,
+    operation_id: &str,
+    limit_kb: u64,
+) -> Result<(), Error> {
+    let worker_id = WorkerId(WORKER.to_string());
+    let operation_id = OperationId::from(operation_id);
+    worker_scheduler
+        .record_action_resource_usage(
+            &worker_id,
+            &operation_id,
+            ActionResourceUsage {
+                peak_memory_kb: limit_kb / 2,
+                sampled: true,
+                outcome: ResourceOutcome::KilledPressure.into(),
+                enforced: true,
+                reserved: Some(Reservation {
+                    memory_kb: limit_kb,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )
+        .await?;
+    worker_scheduler
+        .update_action(
+            &worker_id,
+            &operation_id,
+            UpdateOperationType::UpdateWithActionStage(ActionStage::Completed(ActionResult {
+                exit_code: 9,
+                error: Some(make_err!(
+                    Code::ResourceExhausted,
+                    "Action killed to relieve memory pressure on the worker"
+                )),
+                ..ActionResult::default()
+            })),
+        )
+        .await?;
+    tokio::task::yield_now().await;
+    Ok(())
+}
+
+/// With a limit property, each escalation step writes the next step to the
+/// request and the limit both: the run after a memory kill is booked at its
+/// kill line, and the step grows from the limit it was killed at, not from
+/// the smaller request.
+#[nativelink_test]
+async fn an_escalation_writes_the_next_step_to_the_request_and_the_limit() -> Result<(), Error> {
+    let (scheduler, worker_scheduler) = make_split_scheduler(5, vec![1_000, 4_000, 9_000], 3);
+    let mut rx = add_worker(&scheduler, 1_000_000).await?;
+    let _listener = add_split_action(&scheduler, 5, 1_000, 3_000).await?;
+
+    let (operation_id, request_kb, limit_kb) = next_split_dispatch(&mut rx).await;
+    assert_eq!((request_kb, limit_kb), (1_000, 3_000));
+    // The worker killed it at its limit, and echoes the limit.
+    report_memory_kill(worker_scheduler.as_ref(), &operation_id, 3_000).await?;
+
+    let (operation_id, request_kb, limit_kb) = next_split_dispatch(&mut rx).await;
+    assert_eq!(
+        (request_kb, limit_kb),
+        (4_000, 4_000),
+        "the class above the limit, on both"
+    );
+    report_memory_kill(worker_scheduler.as_ref(), &operation_id, 4_000).await?;
+    let (_, request_kb, limit_kb) = next_split_dispatch(&mut rx).await;
+    assert_eq!((request_kb, limit_kb), (9_000, 9_000));
+    Ok(())
+}
+
+/// A pressure kill is requeued with the request raised to the limit, so the
+/// next run is booked at its kill line; it spends neither `max_job_retries`
+/// (one here, and the action survives two kills) nor an escalation. A
+/// memory kill after it still escalates as before.
+#[nativelink_test]
+async fn a_pressure_kill_requeues_at_the_limit_without_spending_attempts() -> Result<(), Error> {
+    let (scheduler, worker_scheduler) = make_split_scheduler(1, vec![1_000, 4_000, 9_000], 3);
+    let mut rx = add_worker(&scheduler, 1_000_000).await?;
+    let _listener = add_split_action(&scheduler, 6, 1_000, 3_000).await?;
+
+    let (operation_id, request_kb, limit_kb) = next_split_dispatch(&mut rx).await;
+    assert_eq!((request_kb, limit_kb), (1_000, 3_000));
+    report_pressure_kill(worker_scheduler.as_ref(), &operation_id, 3_000).await?;
+
+    let (operation_id, request_kb, limit_kb) = next_split_dispatch(&mut rx).await;
+    assert_eq!(
+        (request_kb, limit_kb),
+        (3_000, 3_000),
+        "requeued booked at its limit, not escalated"
+    );
+    // Booked at its limit already: it runs again as it was.
+    report_pressure_kill(worker_scheduler.as_ref(), &operation_id, 3_000).await?;
+    let (operation_id, request_kb, limit_kb) = next_split_dispatch(&mut rx).await;
+    assert_eq!((request_kb, limit_kb), (3_000, 3_000));
+
+    // A kill at its own limit is still an escalation.
+    report_memory_kill(worker_scheduler.as_ref(), &operation_id, 3_000).await?;
+    let (_, request_kb, limit_kb) = next_split_dispatch(&mut rx).await;
+    assert_eq!((request_kb, limit_kb), (4_000, 4_000));
+    Ok(())
+}
+
+/// `max_pressure_retries` bounds the requeues: with two, the third pressure
+/// kill ends the action, and the client hears why.
+#[nativelink_test]
+async fn pressure_kills_past_the_budget_fail_the_action() -> Result<(), Error> {
+    let (scheduler, worker_scheduler) = make_split_scheduler(5, vec![], 2);
+    let mut rx = add_worker(&scheduler, 1_000_000).await?;
+    let mut listener = add_split_action(&scheduler, 7, 1_000, 3_000).await?;
+
+    for _ in 0..3 {
+        let (operation_id, _, _) = next_split_dispatch(&mut rx).await;
+        report_pressure_kill(worker_scheduler.as_ref(), &operation_id, 3_000).await?;
+    }
+    let result = wait_for_completion(&mut listener).await;
+    let err = result
+        .error
+        .expect("the third pressure kill is past the budget");
+    assert_eq!(err.code, Code::FailedPrecondition, "{err}");
+    let message = err.to_string();
+    assert!(
+        message.contains("under memory pressure 3 times"),
+        "{message}"
+    );
+    assert!(message.contains("could not keep it in memory"), "{message}");
     Ok(())
 }

@@ -1010,7 +1010,7 @@ pub static WORKER_METRICS: LazyLock<WorkerMetrics> = LazyLock::new(|| {
 
         dispatch_requeues: meter
             .u64_counter("scheduler.dispatch.requeues")
-            .with_description("Dispatches sent back to the queue untried, by reason: declined, channel_full, unacknowledged")
+            .with_description("Dispatches sent back to the queue, by reason: declined, channel_full, unacknowledged (untried); memory_escalation, memory_pressure (killed, run again)")
             .build(),
 
         worker_keepalives: meter

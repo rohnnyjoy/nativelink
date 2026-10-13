@@ -87,6 +87,24 @@ pub struct PendingActionInfoData {
     /// The last resource usage the worker reported for this operation; it
     /// arrives just before the result and says whether the result is a kill.
     pub last_usage: Option<ActionResourceUsage>,
+    /// What the ledger charged for it (`Worker::charged`): the action's
+    /// properties, with the memory request raised to the limit on a worker
+    /// that is not guarded. Restored from here, so what was taken is what
+    /// comes back.
+    pub charged: PlatformProperties,
+}
+
+/// Which of an action's two memory numbers a worker's ledger charges.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MemoryCharge {
+    /// The limit: the worker has nothing behind a request below it (no
+    /// guard, a cgroup the kernel takes whole, an older or a stock
+    /// worker), so it is booked as with one number and never overcommitted.
+    #[default]
+    Limit,
+    /// The request: the worker guards its memory as a whole, so its actions
+    /// may together be booked below their limits.
+    Request,
 }
 
 /// Represents a connection to a worker and used as the medium to
@@ -132,6 +150,18 @@ pub struct Worker {
     /// worker even when this scheduler thinks it idle.
     pub admits_when_idle: bool,
 
+    /// What the ledger charges an action for memory on this worker
+    /// (`charged`): its request, where the worker said on connection that
+    /// it guards its memory as a whole (a pressure guard against a cgroup
+    /// the kernel takes one process of); its limit on any other.
+    pub memory_charge: MemoryCharge,
+
+    /// The request and limit properties the ledger charges by: with these
+    /// set and the worker not guarded, an action's request is raised to its
+    /// limit for the ledger and the fit. From `memory_escalation`'s
+    /// `property` and `limit_property`.
+    pub limit_charge: Option<(String, String)>,
+
     /// The smallest reservation this worker declined for load while it held
     /// nothing else, from a worker that does not admit when idle (an older
     /// one, or one with no cgroup limit). It is not offered that much or
@@ -164,6 +194,14 @@ pub struct Worker {
     /// head-of-line hold when the worker, drained for an action, still
     /// refused it. `None` until the worker has reported idle.
     pub idle_free_kb: Option<u64>,
+
+    /// What the scheduler has sent the worker since `last_load`, summed
+    /// under the live memory veto's property. The report cannot know of
+    /// these actions, and none of them has used its memory yet, so the
+    /// veto debits this from what the report says is free; one pass that
+    /// places two actions on one report no longer lets both through a
+    /// figure that fits one. Reset when the next load arrives.
+    pub placed_since_load_kb: u64,
 
     /// Stats about the worker.
     #[metric]
@@ -244,12 +282,15 @@ impl Worker {
             is_paused: false,
             pause_needs_kb: None,
             admits_when_idle: false,
+            memory_charge: MemoryCharge::Limit,
+            limit_charge: None,
             idle_declined_kb: None,
             is_draining: false,
             max_inflight_tasks,
             last_load: None,
             reported_lent_kb: 0,
             idle_free_kb: None,
+            placed_since_load_kb: 0,
             metrics: Arc::new(Metrics {
                 connected_timestamp: SystemTime::now()
                     .duration_since(UNIX_EPOCH)
@@ -397,6 +438,7 @@ impl Worker {
         action_info: ActionInfoWithProps,
         dispatched_at: WorkerTimestamp,
     ) -> Result<(), Error> {
+        let charged = self.charged(&action_info.platform_properties);
         let tx = &mut self.tx;
         let worker_platform_properties = &mut self.platform_properties;
         let running_action_infos = &mut self.running_action_infos;
@@ -417,10 +459,7 @@ impl Worker {
                 // Send first: a channel that will not take the message
                 // leaves the ledger untouched, and the caller requeues.
                 send_msg_to_worker(tx, update_for_worker::Update::StartAction(start_execute))?;
-                reduce_platform_properties(
-                    worker_platform_properties,
-                    &action_info.platform_properties,
-                );
+                reduce_platform_properties(worker_platform_properties, &charged);
                 running_action_infos.insert(
                     operation_id,
                     PendingActionInfoData {
@@ -429,11 +468,39 @@ impl Worker {
                         dispatched_at,
                         accepted: false,
                         last_usage: None,
+                        charged,
                     },
                 );
                 Ok(())
             })
             .await
+    }
+
+    /// What the ledger charges for an action with `props`: the properties as
+    /// they are on a guarded worker; on any other, the memory request raised
+    /// to the action's limit (the `ignore` property the scheduler set beside
+    /// it), so a worker with nothing behind a request below its limit (no
+    /// guard, a cgroup the kernel takes whole, an older or a stock worker)
+    /// is booked as with one number and never overcommitted.
+    pub fn charged(&self, props: &PlatformProperties) -> PlatformProperties {
+        let mut charged = props.clone();
+        if self.memory_charge == MemoryCharge::Request {
+            return charged;
+        }
+        let Some((request_property, limit_property)) = &self.limit_charge else {
+            return charged;
+        };
+        let limit_kb = match charged.properties.get(limit_property) {
+            Some(value) => value.as_str().parse::<u64>().unwrap_or(0),
+            None => 0,
+        };
+        if let Some(PlatformPropertyValue::Minimum(request_kb)) =
+            charged.properties.get_mut(request_property)
+            && limit_kb > *request_kb
+        {
+            *request_kb = limit_kb;
+        }
+        charged
     }
 
     /// Releases everything the action reserved. This is the only place the
@@ -449,7 +516,7 @@ impl Worker {
                 self.id, operation_id
             )
         })?;
-        self.restore_platform_properties(&pending_action_info.action_info.platform_properties);
+        self.restore_platform_properties(&pending_action_info.charged);
         self.is_paused = false;
         self.pause_needs_kb = None;
         self.metrics.actions_completed.inc();

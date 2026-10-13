@@ -388,6 +388,36 @@ pub struct SimpleSpec {
     #[serde(default)]
     pub live_memory_veto: Option<String>,
 
+    /// Memory, in KiB, a worker must have to spare beyond what an action
+    /// asks before the live memory veto lets the action onto it. The veto
+    /// compares the action's `live_memory_veto` property against what the
+    /// worker reported free, less what the scheduler has sent it since that
+    /// report and less what its running actions are still expected to take
+    /// (`owed_kb` in the load report), and this margin is added to what the
+    /// action asks. A margin covers what neither figure sees: the worker's
+    /// own process growing, page cache it cannot drop at once, an action
+    /// peaking above its request. Has no effect without `live_memory_veto`.
+    /// Default: 0
+    #[serde(default, deserialize_with = "convert_numeric_with_shellexpand")]
+    pub live_memory_margin_kb: u64,
+
+    /// How many times an action a worker killed under memory pressure
+    /// (`KILLED_PRESSURE`: the worker as a whole ran short and chose this
+    /// action to free room, or the kernel's OOM killer took it) is queued
+    /// again before the scheduler completes it with `FailedPrecondition`.
+    /// The action did nothing wrong on its own, so these do not spend
+    /// `max_job_retries` and are not memory escalations. With
+    /// `memory_escalation.limit_property` set, the action is queued again
+    /// with its request raised to its limit, so the next run is booked at
+    /// its kill line and a worker's pressure guard does not choose it again.
+    /// 0 requeues nothing: the first pressure kill completes the action.
+    /// Default: 3
+    #[serde(
+        default = "default_max_pressure_retries",
+        deserialize_with = "convert_numeric_with_shellexpand"
+    )]
+    pub max_pressure_retries: usize,
+
     /// When a worker reports an action killed for memory (`KILLED_MEMORY`,
     /// by its own reservation enforcement or by the kernel), requeue the
     /// action with a larger reservation instead of failing it. Escalations
@@ -570,6 +600,10 @@ pub struct HeadOfLineReservationSpec {
     pub after_s: u64,
 }
 
+const fn default_max_pressure_retries() -> usize {
+    3
+}
+
 #[derive(Deserialize, Serialize, Debug, Clone)]
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "dev-schema", derive(JsonSchema))]
@@ -578,6 +612,22 @@ pub struct MemoryEscalationSpec {
     /// Default: `memory_kb`
     #[serde(default = "default_historical_resource_memory_property_name")]
     pub property: String,
+
+    /// The platform property carrying the memory limit, when actions carry
+    /// a request and a limit apart (see `historical_resource`'s
+    /// `memory_limit_property_name`). Each escalation then writes the next
+    /// step to both `property` and this one, so the run that follows is
+    /// booked at its kill line and grows from the limit it was killed at,
+    /// and a memory-pressure requeue raises `property` to this one's value.
+    /// Declare it `ignore` in `supported_platform_properties`: it is passed
+    /// to the worker and never packed.
+    /// Default: unset (one number: the reservation is the limit)
+    /// It is also what the ledger charges, in place of `property`, on a
+    /// worker that did not register as guarding its memory
+    /// (`ConnectWorkerRequest.memory_guarded`): such a worker is booked as
+    /// with one number and never overcommitted.
+    #[serde(default)]
+    pub limit_property: Option<String>,
 
     /// Each kill scales the reservation by this factor, in hundredths:
     /// 200 doubles it, 150 adds half.
@@ -697,6 +747,9 @@ pub struct HistoricalResourceSpec {
     ///   { "target_id": "//pkg:test", "action_mnemonic": "TestRunner", "cpu_count": 2, "memory_kb": 12582912 }
     /// ]
     /// ```
+    /// An entry may also carry `memory_limit_kb` beside `memory_kb`; it is
+    /// read only with `memory_limit_property_name` set, and absent means the
+    /// limit is `memory_kb`.
     /// or:
     /// ```json
     /// { "hints": [ ... ] }
@@ -731,6 +784,21 @@ pub struct HistoricalResourceSpec {
         deserialize_with = "convert_string_with_shellexpand"
     )]
     pub memory_property_name: String,
+
+    /// Platform property name for the memory limit, in KiB, when hints
+    /// carry a request and a limit apart. Set, `memory_property_name`
+    /// carries the request (what placement charges: the action's expected
+    /// peak) and this property the limit (what the worker's kill line is
+    /// based on). A hint's `memory_kb` is the request and its
+    /// `memory_limit_kb` the limit, the limit taking the request when the
+    /// hint has none; a class, a cold start and an action no hint matches
+    /// set the limit to the request. The limit is never below the request.
+    /// Declare it `ignore` on the nested scheduler: it is passed to the
+    /// worker and never packed, so the limits on one worker may add up past
+    /// what it advertises while the requests may not.
+    /// Default: unset (one number: the reservation is the limit)
+    #[serde(default)]
+    pub memory_limit_property_name: Option<String>,
 
     /// Platform property name used for disk minimums, expressed in KiB.
     /// Declared as `minimum` on the nested scheduler, like the CPU name.

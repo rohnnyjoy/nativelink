@@ -106,6 +106,13 @@ pub struct AwaitedAction {
     #[serde(default)]
     #[metric(help = "How many times the AwaitedAction was escalated")]
     pub escalations: usize,
+
+    /// Requeues after a worker killed the action to relieve memory
+    /// pressure on the worker as a whole. Neither an attempt nor an
+    /// escalation. Absent in older records.
+    #[serde(default)]
+    #[metric(help = "How many times the AwaitedAction was killed under memory pressure")]
+    pub pressure_retries: usize,
 }
 
 impl AwaitedAction {
@@ -149,6 +156,7 @@ impl AwaitedAction {
             attempts: 0,
             worker_losses: 0,
             escalations: 0,
+            pressure_retries: 0,
             last_worker_updated_timestamp: now,
             last_client_keepalive_timestamp: now,
             maybe_origin_metadata,

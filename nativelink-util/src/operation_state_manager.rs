@@ -157,6 +157,11 @@ pub enum UpdateOperationType {
     /// The worker killed the action for a resource it had declared too
     /// little of; requeue it with a larger reservation, within the retry cap.
     UpdateWithEscalation(Escalation),
+
+    /// The worker killed the action to relieve memory pressure on the
+    /// worker as a whole, not for exceeding its own limit. Requeue it,
+    /// within its own budget, booked as `PressureRequeue` says.
+    UpdateWithPressureRequeue(PressureRequeue),
 }
 
 /// Why a dispatched action is going back to the queue untried.
@@ -178,6 +183,24 @@ pub struct Escalation {
     /// Set on the last step: the CPU property and the largest worker's
     /// whole CPU, so the action runs alone there.
     pub cpu: Option<(String, u64)>,
+    /// The property carrying the memory limit, when actions carry a
+    /// request and a limit apart: it is set to `value` too, so the run that
+    /// follows is booked at its kill line.
+    pub limit_property: Option<String>,
+}
+
+/// How an action killed under memory pressure runs again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PressureRequeue {
+    /// Properties and the values to set them to: the request raised to the
+    /// action's limit, so the next run is booked at its kill line and a
+    /// worker's pressure guard spares it, and the limit lowered to the same
+    /// figure where the fleet's ceiling clamped the raise, so the two stay
+    /// one number. Empty requeues it as it was.
+    pub raise: Vec<(String, u64)>,
+    /// The error the kill produced, kept for the client if the budget ends
+    /// the requeues.
+    pub reason: Error,
 }
 
 #[async_trait]

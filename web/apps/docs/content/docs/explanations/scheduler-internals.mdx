@@ -162,7 +162,18 @@ kubelet counts it for eviction, except that `file_dirty` and
 inactive, clean cache a worker's own I/O built up does not count against
 it. A worker reporting less than the action asks for is skipped for that
 action; a worker that reports
-nothing, such as one older than v1.7.3, is never vetoed. Two metrics go with
+nothing, such as one older than v1.7.3, is never vetoed. The free figure is
+debited before it is compared: by what the scheduler has sent the worker
+since the report (the report cannot know of those actions, and none has used
+its memory yet; the debit resets when the next report arrives), and by the
+report's `owed_kb`, what the worker's running actions are still expected to
+take beyond what they use now. A worker passes when what is left covers the
+action plus `live_memory_margin_kb` (default 0). So one pass that places two
+actions on one report no longer lets both through a figure that fits one,
+and a burst onto a worker whose actions have only just started is held back.
+The head-of-line hold projects a drained worker as its report plus what its
+running actions were lent, never adding what is owed: memory an action has
+not taken does not come back when it finishes. Two metrics go with
 this: `worker.keepalive.gap` is the seconds between consecutive messages from
 a worker, which is what `worker_timeout_s` should be judged against, and
 `worker.disconnections` carries a `worker.disconnect.reason` of
@@ -241,6 +252,33 @@ kill steps the reservation to the next class instead of scaling it, and a
 kill at the top class fails the action. Older hint files still load: every
 new field is optional.
 
+### Request and limit [#request-and-limit]
+
+With **`memory_limit_property_name`** set on the `historical_resource`
+scheduler, an action carries two memory numbers, as a Kubernetes pod does.
+`memory_property_name` (a `minimum`) carries the *request*, the expected
+peak: it is what the ledger, the live veto, `best_fit` and the head-of-line
+hold charge. The limit property, declared `ignore` on the nested scheduler,
+carries the *limit*, the base of the worker's kill line; it matches every
+worker, is never subtracted from one, and reaches the worker as a string in
+the `StartExecute` platform. The requests on a worker may not add up past
+what it advertises; the limits may. A hint's `memory_kb` is the request and
+its `memory_limit_kb` the limit (the request when absent); a class, a cold
+start and a value the client sent book the limit at the request, and the
+limit is never below the request. Without the setting an action carries one
+number, as before.
+
+With **`memory_escalation.limit_property`** naming the same property, an
+escalation grows from the limit the action was killed at and writes the next
+step to both numbers, so the retried run is booked at its kill line. A
+worker whose actions together outgrow it kills one of them under pressure
+and reports `KILLED_PRESSURE`; the scheduler requeues that action with its
+request raised to its limit, which the worker's pressure guard then never
+chooses. That is no escalation and no failed attempt: it has its own budget,
+`max_pressure_retries` (default 3), counted in the action's
+`pressure_retries`, and `scheduler.dispatch.requeues` counts it with the
+reason `memory_pressure`.
+
 ### Platform properties are typed, and `Minimum` is a resource pool [#platform-properties-are-typed-and-minimum-is-a-resource-pool]
 
 Every property key a worker advertises has a declared type:
@@ -276,8 +314,8 @@ the configuration side.
 
 ## Retries, and what "failed" means [#retries-and-what-failed-means]
 
-The attempt counter is incremented by one event, and two other events that
-used to spend it now have budgets of their own.
+The attempt counter is incremented by one event, and three other events
+that do not spend it have budgets of their own.
 
 **`UpdateWithError` increments the attempt count, unless the error is
 `ResourceExhausted`.** Backpressure is free. A worker saying "I am too busy"
@@ -295,6 +333,12 @@ OOM-kills its worker from taking one down forever. Past it the client sees a
 (default 8), not `max_job_retries` either: the scheduler chose to run the
 action again with more memory, and the fleet's ceiling bounds how far that
 goes.
+
+**`UpdateWithPressureRequeue` counts against `max_pressure_retries`**
+(default 3): the worker killed the action to relieve memory pressure on the
+whole worker, which is neither the action's failure nor a size it outgrew.
+Past it the client sees a `FAILED_PRECONDITION` saying the worker could not
+keep the action in memory.
 
 The limit is checked as `attempts > max_job_retries`, strictly, so the
 default of `3` permits **four** total executions. That off-by-one is in the

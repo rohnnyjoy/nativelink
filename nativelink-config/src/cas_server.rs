@@ -828,7 +828,10 @@ pub struct CapacityConfig {
     /// enforcement ceiling (reservation plus headroom) still fit the limit.
     /// Unset, it follows `resource_enforcement.memory_headroom_percent`
     /// while memory enforcement is on, and is 0 otherwise, so the two
-    /// cannot drift apart by being typed twice.
+    /// cannot drift apart by being typed twice. A deployment that sends a
+    /// request and a limit per action sets 0: the scheduler packs requests,
+    /// each kill line is capped at the room, and `memory_pressure` guards
+    /// the worker as a whole, so the headroom is not taken off twice.
     /// Default: unset
     #[serde(
         default,
@@ -922,6 +925,13 @@ pub enum MemoryEnforcement {
     Soft,
 }
 
+/// What the worker holds a running action to. An action may carry two
+/// memory numbers: a request, its expected peak, which the scheduler packs
+/// by, and a limit, which the worker kills it at (plus
+/// `memory_headroom_percent`). The sum of limits on a worker may exceed
+/// its room while the sum of requests may not; `memory_pressure` covers
+/// the moments the actions together outgrow their requests. A deployment
+/// with one number points both property names at it and sets no guard.
 #[derive(Clone, Deserialize, Serialize, Debug)]
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "dev-schema", derive(JsonSchema))]
@@ -949,8 +959,13 @@ pub struct ResourceEnforcementConfig {
     )]
     pub disk_property_name: String,
 
-    /// Platform property carrying the action's memory reservation in KiB,
-    /// as the scheduler sends it. An action without the property is not
+    /// Platform property carrying the action's memory limit in KiB, as the
+    /// scheduler sends it: the kill line is this times
+    /// `memory_headroom_percent`, capped at the worker's room (its cgroup
+    /// limit less `capacity.overhead_memory_kb`) when `capacity` observed a
+    /// cgroup. A deployment with one number per action points this and
+    /// `memory_request_property_name` at the same property; one with two
+    /// points this at the limit. An action without the property is not
     /// enforced.
     /// Default: `memory_kb`
     #[serde(
@@ -959,8 +974,21 @@ pub struct ResourceEnforcementConfig {
     )]
     pub memory_property_name: String,
 
-    /// Percent above the reservation an action may reach before it is
-    /// killed.
+    /// Platform property carrying the action's memory request in KiB: what
+    /// the scheduler placed it by, its expected peak. Read for the order in
+    /// which `memory_pressure` picks an action to kill, for the memory the
+    /// keepalive reports as still owed to the running actions, and to
+    /// protect an action whose request is at or above its limit (one the
+    /// scheduler already booked at its kill line) from the pressure guard.
+    /// Default: `memory_kb`
+    #[serde(
+        default = "default_memory_property_name",
+        deserialize_with = "convert_string_with_shellexpand"
+    )]
+    pub memory_request_property_name: String,
+
+    /// Percent above its limit (`memory_property_name`) an action may
+    /// reach before it is killed.
     /// Default: 20
     #[serde(
         default = "default_memory_headroom_percent",
@@ -976,6 +1004,76 @@ pub struct ResourceEnforcementConfig {
         deserialize_with = "convert_numeric_with_shellexpand"
     )]
     pub disk_headroom_percent: u64,
+
+    /// Guard the worker as a whole: when the sum of requests fits but the
+    /// actions together use more, kill one action before the cgroup's
+    /// limit takes the worker. Only with `memory: soft`, and only with a
+    /// limit to measure against: the worker's own cgroup's, or `limit_kb`
+    /// where the cgroup carries none; ignored otherwise.
+    /// Default: unset (no guard)
+    #[serde(default)]
+    pub memory_pressure: Option<MemoryPressureConfig>,
+}
+
+/// The worker's memory pressure guard. Every `interval_ms` it reads the
+/// memory its cgroup cannot reclaim (`memory.stat`: anon, shmem, kernel
+/// and sock; never the page cache, dirty pages included),
+/// and when that reaches the cgroup limit less `watermark_kb` it kills one
+/// running action with SIGKILL: the one furthest above its own request, or
+/// the youngest when none is over. An action whose request is at or above
+/// its limit is never chosen while it uses no more than that request. After
+/// a kill it judges again only once the killed action is no longer running,
+/// or five seconds have passed, so a tree still giving its pages back does
+/// not cost a second action. While the memory is within twice the watermark of the
+/// limit the worker declines new actions as load. The kill is reported as
+/// `KILLED_PRESSURE`: not the action's fault, and not a sizing fact.
+#[derive(Copy, Clone, Deserialize, Serialize, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "dev-schema", derive(JsonSchema))]
+pub struct MemoryPressureConfig {
+    /// KiB below the cgroup limit at which the guard kills an action; the
+    /// worker refuses new actions at twice it.
+    /// Default: 1048576 (1 GiB)
+    #[serde(
+        default = "default_memory_pressure_watermark_kb",
+        deserialize_with = "convert_numeric_with_shellexpand"
+    )]
+    pub watermark_kb: u64,
+
+    /// Milliseconds between the guard's reads of the cgroup.
+    /// Default: 100
+    #[serde(
+        default = "default_memory_pressure_interval_ms",
+        deserialize_with = "convert_numeric_with_shellexpand"
+    )]
+    pub interval_ms: u64,
+
+    /// The limit the guard measures against when the worker's own cgroup
+    /// carries none, in KiB: what the pod may use on its node (a container
+    /// without a memory limit still has a cgroup that reports memory.stat
+    /// and memory.events). Ignored when the cgroup carries a limit. 0
+    /// leaves an unlimited cgroup unguarded.
+    /// Default: 0
+    #[serde(default, deserialize_with = "convert_numeric_with_shellexpand")]
+    pub limit_kb: u64,
+}
+
+impl Default for MemoryPressureConfig {
+    fn default() -> Self {
+        Self {
+            watermark_kb: default_memory_pressure_watermark_kb(),
+            interval_ms: default_memory_pressure_interval_ms(),
+            limit_kb: 0,
+        }
+    }
+}
+
+const fn default_memory_pressure_watermark_kb() -> u64 {
+    1_048_576
+}
+
+const fn default_memory_pressure_interval_ms() -> u64 {
+    100
 }
 
 fn default_memory_property_name() -> String {

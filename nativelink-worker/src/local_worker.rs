@@ -202,12 +202,29 @@ struct MemoryAdmission {
     /// decided once at registration and sent to the scheduler then, so the
     /// two never disagree.
     admits_when_idle: bool,
+    /// The cgroup the pressure guard watches and its watermark in KiB, when
+    /// the guard runs: new actions are declined while what the cgroup
+    /// cannot reclaim is within twice the watermark of its limit.
+    pressure: Option<(crate::capacity::LimitedCgroup, u64)>,
 }
 
 /// Why this worker will not run an action it was just sent.
 enum Refusal {
-    AtCapacity { in_flight: u64, max: u64 },
-    Load { needed_kb: u64, free_kb: u64 },
+    AtCapacity {
+        in_flight: u64,
+        max: u64,
+    },
+    Load {
+        needed_kb: u64,
+        free_kb: u64,
+    },
+    /// The worker's memory is within twice the pressure watermark of its
+    /// limit; declined as load, so the scheduler holds off this worker.
+    Pressure {
+        needed_kb: u64,
+        unreclaimable_kb: u64,
+        limit_kb: u64,
+    },
     ShuttingDown,
 }
 
@@ -225,6 +242,18 @@ impl Refusal {
                 format!("needs {needed_kb} KiB, {free_kb} KiB free"),
                 needed_kb,
                 free_kb,
+            ),
+            Self::Pressure {
+                needed_kb,
+                unreclaimable_kb,
+                limit_kb,
+            } => (
+                execute_declined::Reason::Load,
+                format!(
+                    "memory pressure: {unreclaimable_kb} KiB unreclaimable of a {limit_kb} KiB limit"
+                ),
+                needed_kb,
+                limit_kb.saturating_sub(unreclaimable_kb),
             ),
             Self::ShuttingDown => (
                 execute_declined::Reason::ShuttingDown,
@@ -359,8 +388,12 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
         if max > 0 && in_flight >= max {
             return Some(Refusal::AtCapacity { in_flight, max });
         }
-        // The cgroup is read only for an action that reserves memory.
-        let needed_kb = memory_reservation_kb(start_execute, &self.memory.property)?;
+        // The cgroup is read only for an action that reserves memory, or
+        // while the pressure guard runs.
+        let needed_kb = memory_reservation_kb(start_execute, &self.memory.property);
+        if needed_kb.is_none() && self.memory.pressure.is_none() {
+            return None;
+        }
         // With nothing else in flight under a cgroup limit, waiting frees
         // nothing: what the worker reads free now is the most it will ever
         // read, since its own process, its hot page cache and the kernel
@@ -373,7 +406,25 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
         if in_flight == 0 && self.memory.admits_when_idle {
             return None;
         }
-        if let Some(free_kb) = crate::capacity::free_memory_kb()
+        // Near the limit the guard is about to kill, or has just killed, an
+        // action; one more would only be the next to go.
+        if let Some((cgroup, watermark_kb)) = &self.memory.pressure
+            && let Some((unreclaimable_kb, limit_kb)) = crate::pressure::read_pressure(cgroup)
+            && crate::pressure::over_watermark(
+                unreclaimable_kb,
+                limit_kb,
+                watermark_kb.saturating_mul(2),
+            )
+        {
+            return Some(Refusal::Pressure {
+                needed_kb: needed_kb.unwrap_or(0),
+                unreclaimable_kb,
+                limit_kb,
+            });
+        }
+        let needed_kb = needed_kb?;
+        let guard = self.memory.pressure.as_ref().map(|(cgroup, _)| cgroup);
+        if let Some(free_kb) = crate::capacity::free_memory_kb_guarded(guard)
             && free_kb < needed_kb
         {
             return Some(Refusal::Load { needed_kb, free_kb });
@@ -430,6 +481,7 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
     async fn start_keep_alive(&self) -> Result<(), Error> {
         // According to tonic's documentation this call should be cheap and is the same stream.
         let mut grpc_client = self.grpc_client.clone();
+        let running_actions_manager = self.running_actions_manager.clone();
         let timeout = self
             .config
             .worker_api_endpoint
@@ -446,6 +498,10 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
         // Skip the first interval as it happens immediately and we don't need a keep alive until timeout/2 has passed
         interval.tick().await;
 
+        // Free memory is read against the pressure guard's cgroup where it has
+        // one, so what the scheduler's veto sees and what the guard measures
+        // against are one limit (a stated one on a container without its own).
+        let guard = pressure_guard(self.config).map(|(cgroup, _)| cgroup);
         // Explicitly spawn the keep alive loop so it goes onto a different thread from the execute commands.
         // Its failure is this worker's failure: a worker whose keepalives
         // stop reaching the scheduler is evicted `worker_timeout_s` later
@@ -458,8 +514,15 @@ impl<'a, T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorke
                 // What the worker has to spare rides on the keepalive, so a
                 // scheduler with `live_memory_veto` can skip a worker whose
                 // actions declared less than they use.
-                let load = crate::capacity::free_memory_kb()
-                    .map(|free_memory_kb| WorkerLoad { free_memory_kb });
+                // What the running actions are still owed rides with it,
+                // since one just started has used little of its request.
+                let load =
+                    crate::capacity::free_memory_kb_guarded(guard.as_ref()).map(|free_memory_kb| {
+                        WorkerLoad {
+                            free_memory_kb,
+                            owed_kb: running_actions_manager.owed_memory_kb(),
+                        }
+                    });
                 if let Err(e) = grpc_client.keep_alive(KeepAliveRequest { load }).await {
                     error!(?e, "Failed to send KeepAlive in LocalWorker");
                     return Err(e.append("KeepAlive failed; reconnecting to the scheduler"));
@@ -1017,6 +1080,25 @@ impl<
     }
 }
 
+/// The pressure guard's cgroup and configuration when it is to run: the
+/// guard is configured, memory enforcement is soft, and the worker's own
+/// cgroup carries a memory limit.
+fn pressure_guard(
+    config: &LocalWorkerConfig,
+) -> Option<(
+    crate::capacity::LimitedCgroup,
+    nativelink_config::cas_server::MemoryPressureConfig,
+)> {
+    let pressure = crate::pressure::configured(
+        config.resource_enforcement.as_ref(),
+        crate::capacity::memory_is_limited(),
+    )?;
+    Some((
+        crate::capacity::guarded_cgroup(pressure.limit_kb)?,
+        pressure,
+    ))
+}
+
 /// Creates a new `LocalWorker`. The `cas_store` must be an instance of
 /// `FastSlowStore` and will be checked at runtime.
 pub async fn new_local_worker(
@@ -1233,6 +1315,25 @@ pub async fn new_local_worker(
                     .resource_enforcement
                     .as_ref()
                     .and_then(ResourceEnforcement::from_config),
+                // The worker's room: the cgroup's limit less the overhead, or the
+                // pressure guard's configured limit where the cgroup has none.
+                memory_room_kb: config.capacity.as_ref().and_then(|capacity| {
+                    crate::capacity::memory_is_limited()
+                        .then(crate::capacity::observe_cgroup)
+                        .flatten()
+                        .map(|observed| observed.memory_kb)
+                        .or_else(|| {
+                            config
+                                .resource_enforcement
+                                .as_ref()
+                                .and_then(|enforcement| enforcement.memory_pressure)
+                                .map(|pressure| pressure.limit_kb)
+                                .filter(|limit_kb| *limit_kb > 0)
+                        })
+                        .map(|limit_kb| {
+                            crate::capacity::memory_room_kb(limit_kb, capacity.overhead_memory_kb)
+                        })
+                }),
             },
             cas_store: fast_slow_store,
             ac_store,
@@ -1272,6 +1373,13 @@ pub async fn new_local_worker(
             }
         }
     }));
+    if let Some((cgroup, pressure)) = pressure_guard(&config) {
+        // Detached like the sweep below: it runs for the worker's whole life.
+        drop(background_spawn!(
+            "memory_pressure_guard",
+            crate::pressure::run_guard(running_actions_manager.clone(), cgroup, pressure)
+        ));
+    }
     if config.orphan_sweep_interval_s > 0 {
         let interval = Duration::from_secs(config.orphan_sweep_interval_s);
         let manager = running_actions_manager.clone();
@@ -1420,6 +1528,13 @@ impl<T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorker<T,
         // Decided once, so what admission does and what the scheduler is
         // told always agree.
         let admits_when_idle = crate::capacity::memory_is_limited();
+        // Guarded, as the scheduler is told: a pressure guard runs, and the
+        // kernel's OOM killer would take one process of the cgroup, not the
+        // worker whole. Without both, the scheduler books this worker by
+        // limits and never overcommits it (ConnectWorkerRequest).
+        let memory_guarded = pressure_guard(&self.config).is_some_and(|(cgroup, _)| {
+            cgroup.oom_group(crate::capacity::read_cgroup_file) == Some(false)
+        });
         let connect_worker_request = make_connect_worker_request(
             self.config.name.clone(),
             &platform_properties,
@@ -1430,6 +1545,7 @@ impl<T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorker<T,
                 self.config.max_inflight_tasks
             },
             admits_when_idle,
+            memory_guarded,
         )
         .await?;
         let mut update_for_worker_stream = client
@@ -1464,6 +1580,8 @@ impl<T: WorkerApiClientTrait + 'static, U: RunningActionsManager> LocalWorker<T,
             MemoryAdmission {
                 property: memory_property,
                 admits_when_idle,
+                pressure: pressure_guard(&self.config)
+                    .map(|(cgroup, pressure)| (cgroup, pressure.watermark_kb)),
             },
             update_for_worker_stream,
         ))

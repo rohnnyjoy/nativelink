@@ -322,6 +322,171 @@ pub fn parse_memory_stat_reclaimable_kb(memory_stat: &str) -> Option<u64> {
     )
 }
 
+/// Memory in a cgroup's `memory.stat` the kernel cannot drop to make room,
+/// in KiB: `anon` (the processes' own pages), `shmem` (tmpfs and shared
+/// memory, file pages with nowhere to go without swap), `kernel` (stacks,
+/// page tables, unreclaimable slab and the rest the kernel charges),
+/// and `sock` (network buffers). Page cache is left out, dirty pages
+/// included: the kernel reclaims clean cache before it gives up and kills,
+/// and holds writers back for dirty pages rather than killing over them,
+/// while the worker's own CAS writes would count against every action.
+/// Kernels
+/// before 5.18 have no `kernel` line; there the parts it sums
+/// (`kernel_stack`, `pagetables`, `percpu`, `slab_unreclaimable`) are
+/// added instead. `None` without an `anon` line.
+pub fn parse_memory_stat_unreclaimable_kb(memory_stat: &str) -> Option<u64> {
+    let anon = keyed_value(memory_stat, "anon")?;
+    let value = |key: &str| keyed_value(memory_stat, key).unwrap_or(0);
+    let kernel = keyed_value(memory_stat, "kernel").unwrap_or_else(|| {
+        ["kernel_stack", "pagetables", "percpu", "slab_unreclaimable"]
+            .into_iter()
+            .map(value)
+            .fold(0, u64::saturating_add)
+    });
+    let bytes = [anon, value("shmem"), kernel, value("sock")]
+        .into_iter()
+        .fold(0, u64::saturating_add);
+    Some(bytes / 1024)
+}
+
+/// A cgroup's `memory.oom.group`: `true` when the kernel's OOM killer takes
+/// every process in the cgroup at once (what Kubernetes sets on a container
+/// unless the kubelet's `singleProcessOOMKill` is on), `false` when it
+/// takes one. `None` when the file does not parse.
+pub fn parse_memory_oom_group(memory_oom_group: &str) -> Option<bool> {
+    match memory_oom_group.trim() {
+        "0" => Some(false),
+        "1" => Some(true),
+        _ => None,
+    }
+}
+
+/// The `oom_kill` count from a cgroup's `memory.events`: how many
+/// processes in it, or below it, any OOM killer has taken. `None` without
+/// the line.
+pub fn parse_memory_events_oom_kill(memory_events: &str) -> Option<u64> {
+    keyed_value(memory_events, "oom_kill")
+}
+
+/// The room the worker gives its actions: the cgroup's memory limit less
+/// what it keeps for itself.
+pub const fn memory_room_kb(limit_kb: u64, overhead_memory_kb: u64) -> u64 {
+    limit_kb.saturating_sub(overhead_memory_kb)
+}
+
+/// The memory an action is killed at: its limit plus `headroom_percent`,
+/// and never past `room_kb`, the worker's room when it is known. Without
+/// the cap, the line for an action booked at the whole worker would sit
+/// past the cgroup's own limit, so the kernel would take the worker before
+/// the worker took the action.
+pub fn memory_kill_line_kb(limit_kb: u64, headroom_percent: u64, room_kb: Option<u64>) -> u64 {
+    let line = limit_kb.saturating_mul(100 + headroom_percent) / 100;
+    room_kb.map_or(line, |room_kb| line.min(room_kb))
+}
+
+/// The nearest cgroup with a memory limit, from the worker's own up to the
+/// mount root, and that limit: the level whose usage the kernel holds to
+/// it, and so the one whose `memory.stat` and `memory.events` matter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LimitedCgroup {
+    pub dir: PathBuf,
+    pub limit_kb: u64,
+}
+
+impl LimitedCgroup {
+    /// From what `find_limit` returned for `memory.max`.
+    pub fn from_limit((dir, max): (PathBuf, String)) -> Option<Self> {
+        let limit_kb = parse_memory_current_kb(max.trim())?;
+        Some(Self { dir, limit_kb })
+    }
+
+    /// What the cgroup cannot reclaim now, in KiB.
+    pub fn unreclaimable_kb(&self, read: impl Fn(&Path) -> Option<String>) -> Option<u64> {
+        read(&self.dir.join("memory.stat"))
+            .and_then(|stat| parse_memory_stat_unreclaimable_kb(&stat))
+    }
+
+    /// Memory the worker could still give an action against this cgroup's
+    /// limit, in KiB: the limit less the working set (usage less the page
+    /// cache the kernel can drop), as `free_memory_kb_from` reads a limited
+    /// cgroup. For a cgroup whose limit is stated rather than carried, this
+    /// is the figure the keepalive and admission report, so the scheduler's
+    /// veto and the guard measure against the same number.
+    pub fn free_memory_kb(&self, read: impl Fn(&Path) -> Option<String>) -> Option<u64> {
+        let current_kb = read(&self.dir.join("memory.current"))
+            .and_then(|current| parse_memory_current_kb(&current))?;
+        let reclaimable_kb = read(&self.dir.join("memory.stat"))
+            .and_then(|stat| parse_memory_stat_reclaimable_kb(&stat));
+        free_memory_kb_from(Some(self.limit_kb), Some(current_kb), reclaimable_kb, None)
+    }
+
+    /// Whether the kernel's OOM killer would take this cgroup whole
+    /// (`memory.oom.group`).
+    pub fn oom_group(&self, read: impl Fn(&Path) -> Option<String>) -> Option<bool> {
+        read(&self.dir.join("memory.oom.group")).and_then(|value| parse_memory_oom_group(&value))
+    }
+
+    /// The cgroup's OOM kills so far.
+    pub fn oom_kills(&self, read: impl Fn(&Path) -> Option<String>) -> Option<u64> {
+        read(&self.dir.join("memory.events"))
+            .and_then(|events| parse_memory_events_oom_kill(&events))
+    }
+}
+
+/// The worker's [`LimitedCgroup`] on the live system; `None` where no
+/// memory limit applies, and always off Linux.
+#[cfg(target_os = "linux")]
+pub fn limited_cgroup() -> Option<LimitedCgroup> {
+    find_limit(
+        &cgroup_dir(),
+        Path::new("/sys/fs/cgroup"),
+        "memory.max",
+        read_file,
+    )
+    .and_then(LimitedCgroup::from_limit)
+}
+
+#[cfg(not(target_os = "linux"))]
+pub const fn limited_cgroup() -> Option<LimitedCgroup> {
+    None
+}
+
+/// The cgroup the pressure guard measures: the worker's [`LimitedCgroup`]
+/// where a memory limit applies, else its own cgroup against `limit_kb`
+/// when that is set (a container without a memory limit, whose cgroup
+/// still reports `memory.stat` and `memory.events`: the pod's budget on
+/// its node, which the configuration states). `None` with neither, and
+/// always off Linux.
+#[cfg(target_os = "linux")]
+pub fn guarded_cgroup(limit_kb: u64) -> Option<LimitedCgroup> {
+    limited_cgroup().or_else(|| {
+        (limit_kb > 0).then(|| LimitedCgroup {
+            dir: cgroup_dir(),
+            limit_kb,
+        })
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+pub const fn guarded_cgroup(_limit_kb: u64) -> Option<LimitedCgroup> {
+    None
+}
+
+/// What the worker reports free: against the guard's cgroup when the guard
+/// has one (the limited cgroup, or the worker's own against a stated
+/// limit), else `free_memory_kb`.
+pub fn free_memory_kb_guarded(guard: Option<&LimitedCgroup>) -> Option<u64> {
+    match guard {
+        Some(cgroup) => cgroup.free_memory_kb(read_cgroup_file),
+        None => free_memory_kb(),
+    }
+}
+
+/// Reads a cgroup file on the live system, for the readers above.
+pub fn read_cgroup_file(path: &Path) -> Option<String> {
+    read_file(path)
+}
+
 /// Memory the worker could still give an action: the cgroup limit less its
 /// working set (current usage less the page cache the kernel can drop)
 /// when there is a limit, the host's `MemAvailable` when there is not,

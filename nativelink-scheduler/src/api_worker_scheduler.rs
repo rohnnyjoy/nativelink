@@ -42,7 +42,7 @@ use nativelink_util::metrics::{
     record_worker_state,
 };
 use nativelink_util::operation_state_manager::{
-    Decline, Escalation, UpdateOperationType, WorkerStateManager,
+    Decline, Escalation, PressureRequeue, UpdateOperationType, WorkerStateManager,
 };
 use nativelink_util::origin_event::get_node_id;
 use nativelink_util::platform_properties::{PlatformProperties, PlatformPropertyValue};
@@ -126,6 +126,24 @@ fn shortfall_permille(action: &PlatformProperties, worker: &Worker) -> u64 {
         shortfall += missing.saturating_mul(1000) / total;
     }
     shortfall
+}
+
+/// A platform property's value in KiB, whatever the scheduler typed it as:
+/// a request is a `minimum`, a limit is `ignore` and carries its string.
+fn property_kb(properties: &PlatformProperties, name: &str) -> Option<u64> {
+    properties
+        .properties
+        .get(name)
+        .and_then(|value| value.as_str().parse().ok())
+}
+
+/// What the live memory veto counts a worker as able to take: what its load
+/// report says is free, less what its running actions are still expected
+/// to take (`owed_kb`), less `placed_kb` sent to it since the report.
+const fn live_room_kb(load: &WorkerLoad, placed_kb: u64) -> u64 {
+    load.free_memory_kb
+        .saturating_sub(load.owed_kb)
+        .saturating_sub(placed_kb)
 }
 
 /// A worker held for the action at the head of the queue: it takes nothing
@@ -239,6 +257,9 @@ struct ApiWorkerSchedulerImpl {
     /// The `minimum` property compared against each worker's reported free
     /// memory before placement; unset means no veto.
     live_memory_veto: Option<String>,
+    /// What a worker must have to spare beyond the action under the live
+    /// memory veto, in KiB. Shared with `ApiWorkerScheduler`, which sets it.
+    live_memory_margin_kb: Arc<AtomicU64>,
     /// How a memory kill is turned into a retry with a larger reservation;
     /// unset means the kill fails the action.
     memory_escalation: Option<MemoryEscalationSpec>,
@@ -415,14 +436,17 @@ impl ApiWorkerSchedulerImpl {
         }
         // A keepalive without a load (an older worker) leaves the last
         // report in place. A report with
-        // more room than the last one can make a vetoed action eligible
-        // again; less room never does.
+        // more room than the veto last saw can make a vetoed action
+        // eligible again; less room never does. The room is the veto's:
+        // free, less what is owed to running actions, less what was sent
+        // since the report, and a new report takes over everything sent
+        // before it, so the debit starts again from nothing.
         let more_room = load.is_some_and(|load| {
-            let more = worker
-                .last_load
-                .as_ref()
-                .is_none_or(|last| load.free_memory_kb > last.free_memory_kb);
+            let more = worker.last_load.as_ref().is_none_or(|last| {
+                live_room_kb(&load, 0) > live_room_kb(last, worker.placed_since_load_kb)
+            });
             worker.last_load = Some(load);
+            worker.placed_since_load_kb = 0;
             // The report goes with what was lent at the time, so a drain
             // can be projected from it; a report from a worker holding
             // nothing is what a drain can be expected to free at most. See
@@ -493,7 +517,13 @@ impl ApiWorkerSchedulerImpl {
 
     /// Adds a worker to the pool.
     /// Note: This function will not do any task matching.
-    fn add_worker(&mut self, worker: Worker) -> Result<(), Error> {
+    fn add_worker(&mut self, mut worker: Worker) -> Result<(), Error> {
+        worker.limit_charge = self.memory_escalation.as_ref().and_then(|policy| {
+            policy
+                .limit_property
+                .clone()
+                .map(|limit_property| (policy.property.clone(), limit_property))
+        });
         let worker_id = worker.id.clone();
         let platform_properties = worker.platform_properties.clone();
         // A replacement is one out and one in, so the gauge only moves for a
@@ -572,7 +602,10 @@ impl ApiWorkerSchedulerImpl {
         if worker.is_draining || worker.is_paused {
             return false;
         }
-        if !platform_properties.is_satisfied_by(&worker.total_platform_properties, false) {
+        if !worker
+            .charged(platform_properties)
+            .is_satisfied_by(&worker.total_platform_properties, false)
+        {
             return false;
         }
         if let (Some(needed_kb), Some(declined_kb)) = (needed_kb, worker.idle_declined_kb)
@@ -590,7 +623,11 @@ impl ApiWorkerSchedulerImpl {
         // prove that; without the idle cap two such workers were drained
         // for one action in turn, for as long as their running actions kept
         // the projection afloat. The whole-worker exemption is the
-        // matcher's.
+        // matcher's, and so is the margin, which the drained worker must
+        // still have to spare. What the report says is owed to running
+        // actions is not added: it is memory they have not taken yet, so
+        // their finishing does not free it. What was sent since the report
+        // is not subtracted: it will have finished too.
         if let (Some(property), Some(needed_kb), Some(load)) = (
             self.live_memory_veto.as_deref(),
             needed_kb,
@@ -603,7 +640,8 @@ impl ApiWorkerSchedulerImpl {
             let projected = worker
                 .idle_free_kb
                 .map_or(lent_back, |idle_kb| lent_back.min(idle_kb));
-            if needed_kb > projected {
+            let margin_kb = self.live_memory_margin_kb.load(Ordering::Relaxed);
+            if needed_kb.saturating_add(margin_kb) > projected {
                 return false;
             }
         }
@@ -1000,6 +1038,7 @@ impl ApiWorkerSchedulerImpl {
         // The index only does presence checks for Minimum properties since their
         // values change dynamically as jobs are assigned to workers.
         let needed_kb = self.live_memory_veto_kb(platform_properties);
+        let margin_kb = self.live_memory_margin_kb.load(Ordering::Relaxed);
         let reserved_for_other = |worker_id: &WorkerId| {
             !ahead_of_hold
                 && self.reservation.as_ref().is_some_and(|reservation| {
@@ -1008,6 +1047,11 @@ impl ApiWorkerSchedulerImpl {
                 })
         };
         let worker_matches = |(worker_id, w): &(&WorkerId, &Worker)| -> bool {
+            // What this worker is charged: the request, or the limit on a
+            // worker that does not guard a request below it.
+            let charged = w.charged(platform_properties);
+            let platform_properties = &charged;
+            let needed_kb = needed_kb.and_then(|_| self.live_memory_veto_kb(platform_properties));
             if reserved_for_other(worker_id) {
                 if full_worker_logging {
                     info!("Worker {worker_id} is reserved for the action at the head of the queue");
@@ -1040,7 +1084,11 @@ impl ApiWorkerSchedulerImpl {
 
             // The ledger only knows what actions declared; the worker's own
             // report of what it has left catches the ones that declared too
-            // little. A worker that reports nothing is never vetoed.
+            // little. What the report counts as free is debited by what
+            // the worker's running actions are still expected to take and
+            // by what was sent to it since, and the action must fit with
+            // `live_memory_margin_kb` to spare. A worker that reports
+            // nothing is never vetoed.
             // An action that asks for the worker's whole advertised memory
             // (the last escalation step) is not vetoed: a worker seldom
             // reports that much free, since its own process memory and
@@ -1052,7 +1100,7 @@ impl ApiWorkerSchedulerImpl {
             if let (Some(property), Some(needed_kb), Some(load)) =
                 (self.live_memory_veto.as_deref(), needed_kb, w.last_load)
                 && !(w.admits_when_idle && w.running_action_infos.is_empty())
-                && needed_kb > load.free_memory_kb
+                && needed_kb.saturating_add(margin_kb) > live_room_kb(&load, w.placed_since_load_kb)
                 && matches!(
                     w.total_platform_properties.properties.get(property),
                     Some(PlatformPropertyValue::Minimum(advertised_kb)) if needed_kb < *advertised_kb
@@ -1060,8 +1108,8 @@ impl ApiWorkerSchedulerImpl {
             {
                 if full_worker_logging {
                     info!(
-                        "Worker {worker_id} vetoed for this action: it reports {} KiB free, the action asks {needed_kb} KiB ({property})",
-                        load.free_memory_kb
+                        "Worker {worker_id} vetoed for this action: it reports {} KiB free, {} KiB owed to its running actions and {} KiB sent since; the action asks {needed_kb} KiB ({property}) with {margin_kb} KiB to spare",
+                        load.free_memory_kb, load.owed_kb, w.placed_since_load_kb,
                     );
                 }
                 return false;
@@ -1263,23 +1311,29 @@ impl ApiWorkerSchedulerImpl {
         if usage.outcome != ResourceOutcome::KilledMemory as i32 {
             return (update, false);
         }
-        // What it ran under: the worker's echo, else what the scheduler sent.
-        let reserved_kb = usage
-            .reserved
-            .map(|r| r.memory_kb)
-            .filter(|kb| *kb > 0)
-            .or_else(|| {
-                match pending
-                    .action_info
-                    .platform_properties
-                    .properties
-                    .get(&policy.property)
-                {
-                    Some(PlatformPropertyValue::Minimum(kb)) => Some(*kb),
-                    _ => None,
-                }
-            })
-            .unwrap_or(0);
+        let properties = &pending.action_info.platform_properties;
+        let echoed_kb = usage.reserved.map(|r| r.memory_kb).filter(|kb| *kb > 0);
+        let request_kb = property_kb(properties, &policy.property);
+        // What it ran under, which the next step grows from: the worker's
+        // echo, else what the scheduler sent. With a request and a limit
+        // apart, the kill line is the limit's, and the worker echoes the
+        // limit; the largest of the three is the line it crossed. What is
+        // whole is still judged by the request, the number placement
+        // charges: a limit past the largest worker on a small request is
+        // not yet that worker held alone.
+        let (reserved_kb, booked_kb) =
+            if let Some(limit_property) = policy.limit_property.as_deref() {
+                let kill_line_kb = echoed_kb
+                    .into_iter()
+                    .chain(property_kb(properties, limit_property))
+                    .chain(request_kb)
+                    .max()
+                    .unwrap_or(0);
+                (kill_line_kb, request_kb.unwrap_or(0))
+            } else {
+                let reserved_kb = echoed_kb.or(request_kb).unwrap_or(0);
+                (reserved_kb, reserved_kb)
+            };
         let (fleet_memory_kb, fleet_cpu) =
             self.fleet_largest_worker(&policy.property, &policy.cpu_property);
         // `max_kb` caps the fleet's ceiling; it cannot raise it past what a
@@ -1307,7 +1361,7 @@ impl ApiWorkerSchedulerImpl {
         };
         let whole_worker_cpu = fleet_cpu.filter(|cores| *cores > 0);
         let already_whole =
-            reserved_kb >= ceiling_kb && whole_worker_cpu.is_none_or(|cores| cpu_held >= cores);
+            booked_kb >= ceiling_kb && whole_worker_cpu.is_none_or(|cores| cpu_held >= cores);
         if already_whole {
             warn!(
                 ?worker_id,
@@ -1393,7 +1447,88 @@ impl ApiWorkerSchedulerImpl {
                 value,
                 reason,
                 cpu,
+                limit_property: policy.limit_property.clone(),
             }),
+            true,
+        )
+    }
+
+    /// Turns a result that the worker's last usage report says was a kill
+    /// to relieve memory pressure on the worker as a whole into a requeue.
+    /// The action did not outgrow its limit, so this is no escalation: with
+    /// `memory_escalation.limit_property` set the request is raised to the
+    /// limit (within what the largest worker advertises), booking the next
+    /// run at its kill line, which the worker's pressure guard spares; an
+    /// action already booked there runs again as it was. Returns the update
+    /// to apply and whether it was requeued.
+    fn maybe_requeue_for_pressure(
+        &self,
+        worker_id: &WorkerId,
+        operation_id: &OperationId,
+        update: UpdateOperationType,
+    ) -> (UpdateOperationType, bool) {
+        let UpdateOperationType::UpdateWithActionStage(ActionStage::Completed(result)) = &update
+        else {
+            return (update, false);
+        };
+        let Some(pending) = self
+            .workers
+            .peek(worker_id)
+            .and_then(|worker| worker.running_action_infos.get(operation_id))
+        else {
+            return (update, false);
+        };
+        let Some(usage) = pending.last_usage.as_ref() else {
+            return (update, false);
+        };
+        if usage.outcome != ResourceOutcome::KilledPressure as i32 {
+            return (update, false);
+        }
+        let properties = &pending.action_info.platform_properties;
+        let raise = self.memory_escalation.as_ref().and_then(|policy| {
+            let limit_kb = property_kb(properties, policy.limit_property.as_deref()?)?;
+            let (fleet_memory_kb, _) = self.fleet_largest_worker(&policy.property, "");
+            let ceiling_kb = if policy.max_kb > 0 {
+                fleet_memory_kb.min(policy.max_kb)
+            } else {
+                fleet_memory_kb
+            };
+            let target_kb = if ceiling_kb > 0 {
+                limit_kb.min(ceiling_kb)
+            } else {
+                limit_kb
+            };
+            let request_kb = property_kb(properties, &policy.property).unwrap_or(0);
+            (target_kb > request_kb).then(|| {
+                let mut raise = vec![(policy.property.clone(), target_kb)];
+                // A limit the ceiling clamped the raise under comes down to
+                // it, so request and limit stay one number and the guard
+                // spares the run.
+                if target_kb < limit_kb
+                    && let Some(limit_property) = policy.limit_property.clone()
+                {
+                    raise.push((limit_property, target_kb));
+                }
+                raise
+            })
+        });
+        let raise = raise.unwrap_or_default();
+        let reason = result.error.clone().unwrap_or_else(|| {
+            make_err!(
+                Code::ResourceExhausted,
+                "Action was killed at {} KiB to relieve memory pressure on worker {worker_id}",
+                usage.peak_memory_kb
+            )
+        });
+        warn!(
+            ?worker_id,
+            ?operation_id,
+            peak_memory_kb = usage.peak_memory_kb,
+            raised = ?raise,
+            "Action killed under memory pressure on its worker; requeuing"
+        );
+        (
+            UpdateOperationType::UpdateWithPressureRequeue(PressureRequeue { raise, reason }),
             true,
         )
     }
@@ -1439,7 +1574,8 @@ impl ApiWorkerSchedulerImpl {
             // room, so it gets nothing more until it says otherwise.
             UpdateOperationType::UpdateWithDecline(_) => (true, true),
             UpdateOperationType::UpdateWithDisconnect
-            | UpdateOperationType::UpdateWithEscalation(_) => (true, false),
+            | UpdateOperationType::UpdateWithEscalation(_)
+            | UpdateOperationType::UpdateWithPressureRequeue(_) => (true, false),
             UpdateOperationType::ExecutionComplete => {
                 // The process has exited but the action is still resident on
                 // the worker until its result arrives, so nothing is released
@@ -1520,6 +1656,9 @@ impl ApiWorkerSchedulerImpl {
         action_info: ActionInfoWithProps,
         dispatched_at: WorkerTimestamp,
     ) -> Result<(), Error> {
+        let placed_kb = self
+            .live_memory_veto_kb(&action_info.platform_properties)
+            .unwrap_or(0);
         if let Some(worker) = self.workers.get_mut(&worker_id) {
             let notify_worker_result = worker
                 .notify_update(WorkerUpdate::RunAction(Box::new((
@@ -1602,6 +1741,10 @@ impl ApiWorkerSchedulerImpl {
                     .await;
                 return Result::<(), _>::Err(err).merge(evicted).merge(requeued);
             }
+            // The worker's last load report cannot know of this action, and
+            // the action has used none of its memory yet: debit it until the
+            // next report, so the rest of this pass sees the room it took.
+            worker.placed_since_load_kb = worker.placed_since_load_kb.saturating_add(placed_kb);
             // The action the reservation was for is placed, here or on a
             // worker that had room first; the reserved worker is open to
             // everything again, which is room the fleet did not have.
@@ -1846,6 +1989,9 @@ pub struct ApiWorkerScheduler {
     /// See `ApiWorkerSchedulerImpl::capacity_generation`; read here without
     /// the lock.
     capacity_generation: Arc<AtomicU64>,
+    /// See `ApiWorkerSchedulerImpl::live_memory_margin_kb`; set here
+    /// without the lock.
+    live_memory_margin_kb: Arc<AtomicU64>,
     #[metric(group = "platform_property_manager")]
     platform_property_manager: Arc<PlatformPropertyManager>,
 
@@ -1898,12 +2044,14 @@ impl ApiWorkerScheduler {
         );
         let local_fleet_change_notify = Arc::new(Notify::new());
         let capacity_generation = Arc::new(AtomicU64::new(0));
+        let live_memory_margin_kb = Arc::new(AtomicU64::new(0));
         Arc::new(Self {
             inner: Mutex::new(ApiWorkerSchedulerImpl {
                 workers: Workers(LruCache::unbounded()),
                 worker_state_manager,
                 allocation_strategy,
                 live_memory_veto,
+                live_memory_margin_kb: live_memory_margin_kb.clone(),
                 memory_escalation,
                 worker_change_notify,
                 capacity_generation: capacity_generation.clone(),
@@ -1932,7 +2080,16 @@ impl ApiWorkerScheduler {
             maybe_origin_event_tx,
             local_fleet_change_notify,
             capacity_generation,
+            live_memory_margin_kb,
         })
+    }
+
+    /// Sets what a worker must have to spare beyond an action under the
+    /// live memory veto, in KiB (`SimpleSpec::live_memory_margin_kb`). 0,
+    /// the value `new` starts with, asks only that the action fit.
+    pub fn set_live_memory_margin_kb(&self, margin_kb: u64) {
+        self.live_memory_margin_kb
+            .store(margin_kb, Ordering::Relaxed);
     }
 
     /// Whether no worker is connected here and, as far as a trusted census
@@ -2363,6 +2520,10 @@ impl WorkerScheduler for ApiWorkerScheduler {
         update: UpdateOperationType,
     ) -> Result<(), Error> {
         let mut inner = self.inner.lock().await;
+        let (update, pressure) = inner.maybe_requeue_for_pressure(worker_id, operation_id, update);
+        if pressure {
+            record_dispatch_requeue("memory_pressure");
+        }
         let (update, escalated) = inner.maybe_escalate(worker_id, operation_id, update);
         if escalated {
             record_dispatch_requeue("memory_escalation");

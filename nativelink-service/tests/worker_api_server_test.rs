@@ -1089,6 +1089,7 @@ pub async fn a_decline_keeps_the_worker_paused_until_a_keepalive_test()
         .worker_stream
         .send(Update::KeepAliveRequest(KeepAliveRequest {
             load: Some(WorkerLoad {
+                owed_kb: 0,
                 free_memory_kb: 1_000,
             }),
         }))
@@ -1105,6 +1106,7 @@ pub async fn a_decline_keeps_the_worker_paused_until_a_keepalive_test()
         .worker_stream
         .send(Update::KeepAliveRequest(KeepAliveRequest {
             load: Some(WorkerLoad {
+                owed_kb: 0,
                 free_memory_kb: 5_000,
             }),
         }))
@@ -1222,7 +1224,10 @@ pub async fn a_slow_result_does_not_stop_the_stream_reads_test()
             test_context
                 .worker_stream
                 .send(Update::KeepAliveRequest(KeepAliveRequest {
-                    load: Some(WorkerLoad { free_memory_kb }),
+                    load: Some(WorkerLoad {
+                        free_memory_kb,
+                        owed_kb: 0,
+                    }),
                 })),
         )
         .await
